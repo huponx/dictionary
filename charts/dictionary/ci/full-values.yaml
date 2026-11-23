@@ -1,0 +1,19 @@
+application:
+  deployment:
+    replicas: 2
+    container:
+      image:
+        tag: "v2026.08.1-release-e1f4018"
+  ingress:
+    enabled: false
+  secrets:
+    - name: POSTGRES_PASSWORD
+      secretName: data-user-rw
+      key: password
+  config:
+    data:
+      DICTIONARY_ISSUER: https://auth.example.com
+      DICTIONARY_JWKS_URL: http://identity.application.svc.cluster.local:8080/.well-known/jwks.json
+      POSTGRES_HOST: postgres.infrastructure.svc.cluster.local
+      POSTGRES_USER: app_rw
+      POSTGRES_DB: app
