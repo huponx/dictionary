@@ -1,0 +1,68 @@
+# Values of the go-application chart live under `application:` (alias of the dependency).
+# image.tag is written at release time (update-deployment-values); the default only keeps `helm template` working.
+#
+# One port: 9090 gRPC (cluster internal; gatekeeper is the only caller). The service verifies the JWTs that identity
+# issues for the audience `dictionary` (token exchange of gatekeeper), so it needs the issuer and the JWKS URL of
+# identity: set them in the Application values of mm-deploy.
+application:
+  deployment:
+    # The image runs as the distroless `nonroot` user (65532).
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+    # The Anki library writes the deck through a temporary SQLite file: /tmp must be writable.
+    volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 128Mi
+    container:
+      image:
+        repository: huponx/dictionary
+        tag: "0.0.0"
+      port: 9090
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      # config.data below becomes the ConfigMap <name>-env-vars, loaded as environment variables.
+      envFrom:
+        - configMapRef:
+            name: '{{ include "common.name" . }}-env-vars'
+      startupProbe:
+        tcpSocket:
+          port: 9090
+        failureThreshold: 30
+        periodSeconds: 2
+      livenessProbe:
+        tcpSocket:
+          port: 9090
+        periodSeconds: 20
+      readinessProbe:
+        tcpSocket:
+          port: 9090
+        periodSeconds: 10
+      resources:
+        limits:
+          cpu: 500m
+          memory: 256Mi
+        requests:
+          cpu: 50m
+          memory: 96Mi
+  service:
+    enabled: true
+    port: 9090
+  config:
+    data:
+      HOST: "0.0.0.0"
+      PORT: "9090"
+      LOG_ENCODING: json
+      DICTIONARY_AUTH_AUDIENCE: dictionary
+      # The preferences of the users are kept by identity: DICTIONARY_IDENTITY_ADDR, DICTIONARY_TOKEN_URL and
+      # DICTIONARY_CLIENT_ID (config) and DICTIONARY_CLIENT_SECRET (secret) are set in the Application of mm-deploy.
+      DICTIONARY_IDENTITY_AUDIENCE: identity
+  # Secret values stay out of git: reference existing Secrets (mm-deploy overrides this list).
+  secrets: []
+  autoscaling:
+    enabled: false
+  pdb:
+    enabled: false
