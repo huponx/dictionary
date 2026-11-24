@@ -19,7 +19,7 @@ func (s *Service) system(ctx context.Context) (settings.System, error) {
 	if err != nil {
 		return settings.System{}, internal(ctx, "read settings", err)
 	}
-	return settings.FromRows(rows, settings.Defaults(s.cfg.MaxSavedWords)), nil
+	return settings.FromRows(rows, settings.Defaults(s.cfg.MaxSavedWords, s.cfg.ExportedRetentionHours)), nil
 }
 
 func (s *Service) requireDictionary(ctx context.Context, d lookup.Dictionary) error {
@@ -33,15 +33,17 @@ func (s *Service) requireDictionary(ctx context.Context, d lookup.Dictionary) er
 	return nil
 }
 
-func (s *Service) requireExport(ctx context.Context, link bool) error {
+// requireExport checks the export is allowed and returns the settings of the system, which the export needs
+// for remove after export.
+func (s *Service) requireExport(ctx context.Context, link bool) (settings.System, error) {
 	sys, err := s.system(ctx)
 	if err != nil {
-		return err
+		return sys, err
 	}
 	if (link && !sys.AllowExportLink) || (!link && !sys.AllowExportDeck) {
-		return apperror.Wrap(codes.FailedPrecondition, CodeFeatureDisabled+": this export is turned off", nil)
+		return sys, apperror.Wrap(codes.FailedPrecondition, CodeFeatureDisabled+": this export is turned off", nil)
 	}
-	return nil
+	return sys, nil
 }
 
 func settingsName(d lookup.Dictionary) string {
@@ -55,6 +57,7 @@ func toProtoSystem(s settings.System) *dictionaryv1.Settings {
 	return &dictionaryv1.Settings{
 		MaxSavedWords: int32(s.MaxSavedWords), AllowExportDeck: s.AllowExportDeck, AllowExportLink: s.AllowExportLink,
 		EnglishEnabled: s.EnglishEnabled, EnglishViEnabled: s.EnglishViEnabled,
+		RemoveAfterExport: s.RemoveAfterExport, ExportedRetentionHours: int32(s.ExportedRetentionHours),
 	}
 }
 
@@ -66,6 +69,7 @@ func toProtoUser(u settings.User) *dictionaryv1.UserSettings {
 	return &dictionaryv1.UserSettings{
 		EnglishEnabled: u.EnglishEnabled, EnglishViEnabled: u.EnglishViEnabled, DefaultDictionary: d,
 		DeckName: u.DeckName, MaxLookupWords: int32(u.MaxLookupWords),
+		RemoveAfterExport: u.RemoveAfterExport, RemoveAcknowledged: u.RemoveAcknowledged,
 	}
 }
 
@@ -88,6 +92,7 @@ func (s *Service) UpdateSettings(ctx context.Context, req *dictionaryv1.UpdateSe
 	next := settings.System{
 		MaxSavedWords: int(in.GetMaxSavedWords()), AllowExportDeck: in.GetAllowExportDeck(), AllowExportLink: in.GetAllowExportLink(),
 		EnglishEnabled: in.GetEnglishEnabled(), EnglishViEnabled: in.GetEnglishViEnabled(),
+		RemoveAfterExport: in.GetRemoveAfterExport(), ExportedRetentionHours: int(in.GetExportedRetentionHours()),
 	}
 	if err := next.Validate(); err != nil {
 		return nil, apperror.InvalidArgument(err.Error())
@@ -147,6 +152,7 @@ func (s *Service) UpdateMySettings(ctx context.Context, req *dictionaryv1.Update
 	u := settings.User{
 		EnglishEnabled: in.GetEnglishEnabled(), EnglishViEnabled: in.GetEnglishViEnabled(),
 		DefaultDictionary: settings.English, DeckName: in.GetDeckName(), MaxLookupWords: int(in.GetMaxLookupWords()),
+		RemoveAfterExport: in.GetRemoveAfterExport(), RemoveAcknowledged: in.GetRemoveAcknowledged(),
 	}
 	if in.GetDefaultDictionary() == dictionaryv1.Dictionary_DICTIONARY_ENGLISH_VIETNAMESE {
 		u.DefaultDictionary = settings.EnglishVietnamese

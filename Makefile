@@ -2,7 +2,7 @@ GO  ?= go
 BIN ?= bin
 IMAGE_TAG  ?= dev
 IMAGE_REPO ?= ghcr.io/huponx
-# database of `make up` in db-migration; the store tests need it migrated (V15)
+# database of `make up` in db-migration; the store tests need it migrated (V15, V20 and V21)
 TEST_DB ?= postgres://postgres:postgres@localhost:5432/app?sslmode=disable
 
 .PHONY: help tidy upgrade outdated test test-store test-live vet build run docker clean
@@ -13,7 +13,7 @@ help:
 		'upgrade  upgrade the dependencies (PATCH=1: patch releases only), tidy, build and test' \
 		'outdated  list the dependencies that have a newer version' \
 		'test    go test -race ./... (the store tests are skipped without a database)' \
-		'test-store  the store tests against $$TEST_DB (db-migration migrated to V15 or later)' \
+		'test-store  the store tests against $$TEST_DB (db-migration migrated to V21 or later)' \
 		'test-live   call the real dictionary APIs once (DICTIONARY_LIVE=1), to check the parsers' \
 		'vet     go vet ./...' \
 		'build   dictionary into $(BIN)/' \

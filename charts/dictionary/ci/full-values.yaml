@@ -1,6 +1,14 @@
 application:
   deployment:
     replicas: 2
+    # No PVC in the chart test cluster: an emptyDir stands in for the claim dictionary-images.
+    volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 128Mi
+      - name: images
+        emptyDir:
+          sizeLimit: 128Mi
     container:
       image:
         tag: "v2026.08.1-release-e1f4018"

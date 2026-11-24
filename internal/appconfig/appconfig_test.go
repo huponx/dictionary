@@ -29,6 +29,9 @@ func TestLoadDefaultsAndValidate(t *testing.T) {
 	if cfg.Addr() != "0.0.0.0:9090" || cfg.AuthAudience != "dictionary" || cfg.MaxSavedWords != 100 || !cfg.ViFallbackMT {
 		t.Errorf("defaults: %+v", cfg)
 	}
+	if cfg.ImageDir != "" || cfg.ImageMaxBytes != 300<<10 || cfg.ImageMaxDim != 1024 || cfg.ImageMaxPixels != 25_000_000 || cfg.ImageUserQuota != 20<<20 {
+		t.Errorf("image defaults: %+v", cfg)
+	}
 	if got := strings.Join(cfg.Hosts(), " "); got != "api.dictionaryapi.dev upload.wikimedia.org ssl.gstatic.com" {
 		t.Errorf("hosts = %q", got)
 	}
@@ -58,6 +61,10 @@ func TestValidateRejects(t *testing.T) {
 		"retention under an hour":   {"DICTIONARY_EXPORTED_RETENTION": "10m"},
 		"cleanup too often":         {"DICTIONARY_CLEANUP_INTERVAL": "1s"},
 		"port out of range":         {"PORT": "70000"},
+		"image bytes over the body": {"DICTIONARY_IMAGE_MAX_BYTES": "900000"},
+		"image dim tiny":            {"DICTIONARY_IMAGE_MAX_DIM": "10"},
+		"image pixels huge":         {"DICTIONARY_IMAGE_MAX_PIXELS": "1000000000"},
+		"quota under one image":     {"DICTIONARY_IMAGE_USER_QUOTA": "1000"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			env(t, good)

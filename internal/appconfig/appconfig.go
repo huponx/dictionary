@@ -47,7 +47,8 @@ type Dictionary struct {
 	ExportMaxBytes int `env:"DICTIONARY_EXPORT_MAX_BYTES" envDefault:"3145728"`
 	// DeckLinkTTL is how long a download link of a deck works (it works once).
 	DeckLinkTTL time.Duration `env:"DICTIONARY_DECK_LINK_TTL" envDefault:"15m"`
-	// ExportedRetention is how long exported rows are kept before the cleanup deletes them.
+	// ExportedRetention is the default of the system setting "exported retention": how long words that left the
+	// list are kept before the cleanup deletes them (1 hour to 8760 hours).
 	ExportedRetention time.Duration `env:"DICTIONARY_EXPORTED_RETENTION" envDefault:"168h"`
 	// CleanupInterval is the period of that cleanup.
 	CleanupInterval time.Duration `env:"DICTIONARY_CLEANUP_INTERVAL" envDefault:"1h"`
@@ -62,6 +63,16 @@ type Dictionary struct {
 	// ViFallbackMT turns on the machine translation (MyMemory) of the English definitions when the
 	// Vietnamese Wiktionary has no entry for a word.
 	ViFallbackMT bool `env:"DICTIONARY_VI_FALLBACK_MT" envDefault:"true"`
+
+	// ImageDir is the volume the images of the cards are written to (<dir>/<user>/<id>.<ext>). Without it
+	// uploads fail with IMAGES_DISABLED. Every image is shrunk to ImageMaxDim and encoded again (jpeg, or png when
+	// it has transparency); ImageMaxBytes is the largest result, ImageMaxPixels the largest width x height that is
+	// decoded at all and ImageUserQuota the total a user may keep.
+	ImageDir       string `env:"DICTIONARY_IMAGE_DIR"`
+	ImageMaxBytes  int    `env:"DICTIONARY_IMAGE_MAX_BYTES" envDefault:"307200"`
+	ImageMaxDim    int    `env:"DICTIONARY_IMAGE_MAX_DIM" envDefault:"1024"`
+	ImageMaxPixels int    `env:"DICTIONARY_IMAGE_MAX_PIXELS" envDefault:"25000000"`
+	ImageUserQuota int64  `env:"DICTIONARY_IMAGE_USER_QUOTA" envDefault:"20971520"`
 
 	// Base URLs of the providers (overridden in tests).
 	FreeDictURL   string `env:"DICTIONARY_FREEDICT_URL" envDefault:"https://api.dictionaryapi.dev/api/v2/entries/en"`
@@ -120,14 +131,26 @@ func (c Dictionary) Validate() error {
 	if c.DeckLinkTTL < time.Minute || c.DeckLinkTTL > 24*time.Hour {
 		return fmt.Errorf("DICTIONARY_DECK_LINK_TTL must be between 1m and 24h")
 	}
-	if c.ExportedRetention < time.Hour {
-		return fmt.Errorf("DICTIONARY_EXPORTED_RETENTION must be at least 1h")
+	if c.ExportedRetention < time.Hour || c.ExportedRetention > 8760*time.Hour {
+		return fmt.Errorf("DICTIONARY_EXPORTED_RETENTION must be between 1h and 8760h")
 	}
 	if c.CleanupInterval < time.Minute {
 		return fmt.Errorf("DICTIONARY_CLEANUP_INTERVAL must be at least 1m")
 	}
 	if c.LookupCacheTTL < 0 || c.LookupCacheSize < 0 {
 		return fmt.Errorf("the lookup cache settings must not be negative")
+	}
+	if c.ImageMaxBytes < 1<<10 || c.ImageMaxBytes > 700<<10 {
+		return fmt.Errorf("DICTIONARY_IMAGE_MAX_BYTES must be between 1024 and 716800 (the gateway body limit is 1 MiB with base64)")
+	}
+	if c.ImageMaxDim < 128 || c.ImageMaxDim > 4096 {
+		return fmt.Errorf("DICTIONARY_IMAGE_MAX_DIM must be between 128 and 4096")
+	}
+	if c.ImageMaxPixels < 1<<16 || c.ImageMaxPixels > 100_000_000 {
+		return fmt.Errorf("DICTIONARY_IMAGE_MAX_PIXELS must be between 65536 and 100000000")
+	}
+	if c.ImageUserQuota < int64(c.ImageMaxBytes) {
+		return fmt.Errorf("DICTIONARY_IMAGE_USER_QUOTA must be at least DICTIONARY_IMAGE_MAX_BYTES")
 	}
 	if len(c.Hosts()) == 0 {
 		return fmt.Errorf("DICTIONARY_AUDIO_HOSTS must list at least one host")
