@@ -13,6 +13,7 @@ import (
 	"time"
 
 	goanki "github.com/ezynda3/go-anki-deck"
+	"github.com/huponx/dictionary/internal/cardref"
 	"github.com/huponx/gocommon/retry"
 	"go.uber.org/zap"
 )
@@ -32,6 +33,15 @@ type Word struct {
 	Content string
 	AudioUK string
 	AudioUS string
+	// Images are the files of the images Content refers to as <img src="dictimg:<id>">; a reference without a
+	// file loses its tag.
+	Images map[string]Image
+}
+
+// Image is a file of a card.
+type Image struct {
+	Data []byte
+	Ext  string
 }
 
 // Builder builds decks. The audio files are downloaded from AllowedHosts only.
@@ -91,6 +101,14 @@ func (b *Builder) Build(ctx context.Context, deckName string, words []Word) ([]b
 		back := w.Content
 		back = strings.ReplaceAll(back, PlaceholderUS, soundTag(deck, fmt.Sprintf("w%03d_us.mp3", i), files[w.AudioUS]))
 		back = strings.ReplaceAll(back, PlaceholderUK, soundTag(deck, fmt.Sprintf("w%03d_uk.mp3", i), files[w.AudioUK]))
+		back = cardref.ReplaceTags(back, func(id string) string {
+			img, ok := w.Images[id]
+			if !ok || len(img.Data) == 0 {
+				return ""
+			}
+			name := fmt.Sprintf("w%03d_%s.%s", i, id[:8], img.Ext)
+			return deck.AddImage(name, img.Data)
+		})
 		if err := deck.AddCard(w.Word, back); err != nil {
 			return nil, fmt.Errorf("anki: card %q: %w", w.Word, err)
 		}

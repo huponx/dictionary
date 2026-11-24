@@ -95,6 +95,27 @@ func TestBuild(t *testing.T) {
 	}
 }
 
+func TestBuildImages(t *testing.T) {
+	const a, b, c = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"
+	bd := &Builder{Client: http.DefaultClient}
+	imgs := map[string]Image{a: {Data: []byte("jpegbytes"), Ext: "jpg"}, c: {Data: []byte("pngbytes"), Ext: "png"}}
+	data, err := bd.Build(context.Background(), "d", []Word{
+		{Word: "one", Content: `<p>x</p><img src="dictimg:` + a + `"><img src="dictimg:` + b + `">`, Images: imgs}, // b has no file
+		{Word: "two", Content: `<img src="dictimg:` + c + `">`, Images: imgs},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := files(t, data)
+	media := string(f["media"])
+	if !strings.Contains(media, "w000_11111111.jpg") || !strings.Contains(media, "w001_33333333.png") || strings.Contains(media, "22222222") {
+		t.Errorf("media = %s", media)
+	}
+	if bytes.Contains(f["collection.anki2"], []byte("dictimg:")) {
+		t.Error("a dictimg: reference is left in the deck")
+	}
+}
+
 func TestBuildTooLarge(t *testing.T) {
 	b := &Builder{Client: http.DefaultClient, MaxBytes: 10}
 	if _, err := b.Build(context.Background(), "d", []Word{{Word: "a", Content: "b"}}); !errors.Is(err, ErrTooLarge) {

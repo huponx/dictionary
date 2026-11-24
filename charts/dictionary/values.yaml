@@ -11,11 +11,19 @@ application:
       runAsNonRoot: true
       runAsUser: 65532
       runAsGroup: 65532
+      # The images volume is a hostpath PVC owned by root: fsGroup makes it writable for uid 65532.
+      fsGroup: 65532
     # The Anki library writes the deck through a temporary SQLite file: /tmp must be writable.
     volumes:
       - name: tmp
         emptyDir:
           sizeLimit: 128Mi
+      # Card images (DICTIONARY_IMAGE_DIR). The claim is created outside the chart (mm-ansible, tag `pvc`) and
+      # must exist before the pod starts, or it stays Pending. ReadWriteOnce hostpath works on a one-node cluster
+      # only (also with several replicas); on more nodes use a ReadWriteMany class or object storage.
+      - name: images
+        persistentVolumeClaim:
+          claimName: dictionary-images
     container:
       image:
         repository: huponx/dictionary
@@ -24,6 +32,8 @@ application:
       volumeMounts:
         - name: tmp
           mountPath: /tmp
+        - name: images
+          mountPath: /data/images
       # config.data below becomes the ConfigMap <name>-env-vars, loaded as environment variables.
       envFrom:
         - configMapRef:
@@ -60,6 +70,8 @@ application:
       # The preferences of the users are kept by identity: DICTIONARY_IDENTITY_ADDR, DICTIONARY_TOKEN_URL and
       # DICTIONARY_CLIENT_ID (config) and DICTIONARY_CLIENT_SECRET (secret) are set in the Application of mm-deploy.
       DICTIONARY_IDENTITY_AUDIENCE: identity
+      # Where the images of the cards are stored (the PVC mounted above).
+      DICTIONARY_IMAGE_DIR: /data/images
   # Secret values stay out of git: reference existing Secrets (mm-deploy overrides this list).
   secrets: []
   autoscaling:

@@ -25,7 +25,8 @@ func (f *fakePrefs) Put(_ context.Context, s string) error {
 }
 
 func allOn(max int32) *dictionaryv1.Settings {
-	return &dictionaryv1.Settings{MaxSavedWords: max, AllowExportDeck: true, AllowExportLink: true, EnglishEnabled: true, EnglishViEnabled: true}
+	return &dictionaryv1.Settings{MaxSavedWords: max, AllowExportDeck: true, AllowExportLink: true, EnglishEnabled: true, EnglishViEnabled: true,
+		RemoveAfterExport: true, ExportedRetentionHours: 168}
 }
 
 func TestSettingsDefaultsFromConfig(t *testing.T) {

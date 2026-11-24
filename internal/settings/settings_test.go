@@ -6,7 +6,7 @@ import (
 )
 
 func TestSystemDefaultsAndRows(t *testing.T) {
-	def := Defaults(100)
+	def := Defaults(100, 168)
 	if got := FromRows(nil, def); got != def {
 		t.Fatalf("no rows: %+v", got)
 	}
@@ -15,14 +15,14 @@ func TestSystemDefaultsAndRows(t *testing.T) {
 		"unknown": json.RawMessage(`1`), "english_vi_enabled": json.RawMessage(`"yes"`), // wrong type: default
 	}
 	got := FromRows(rows, def)
-	want := System{MaxSavedWords: 250, AllowExportDeck: true, AllowExportLink: false, EnglishEnabled: true, EnglishViEnabled: true}
+	want := System{MaxSavedWords: 250, AllowExportDeck: true, AllowExportLink: false, EnglishEnabled: true, EnglishViEnabled: true, RemoveAfterExport: true, ExportedRetentionHours: 168}
 	if got != want {
 		t.Fatalf("got %+v want %+v", got, want)
 	}
 }
 
 func TestChangedWritesOnlyWhatDiffers(t *testing.T) {
-	cur := Defaults(100)
+	cur := Defaults(100, 168)
 	next := cur
 	next.MaxSavedWords = 50
 	next.AllowExportLink = false
@@ -36,11 +36,13 @@ func TestChangedWritesOnlyWhatDiffers(t *testing.T) {
 }
 
 func TestSystemValidate(t *testing.T) {
-	ok := Defaults(100)
+	ok := Defaults(100, 168)
 	bad := []System{
 		{MaxSavedWords: 0, EnglishEnabled: true},
 		{MaxSavedWords: MaxSavedWordsLimit + 1, EnglishEnabled: true},
 		{MaxSavedWords: 10},
+		{MaxSavedWords: 10, EnglishEnabled: true, ExportedRetentionHours: 0},
+		{MaxSavedWords: 10, EnglishEnabled: true, ExportedRetentionHours: MaxRetentionHours + 1},
 	}
 	if err := ok.Validate(); err != nil {
 		t.Fatal(err)
@@ -59,7 +61,7 @@ func TestUserRoundTripAndDefaults(t *testing.T) {
 	if got := ParseUser("{not json"); got != UserDefaults() {
 		t.Fatalf("%+v", got)
 	}
-	u := User{EnglishEnabled: false, EnglishViEnabled: true, DefaultDictionary: EnglishVietnamese, DeckName: "Words", MaxLookupWords: 5}
+	u := User{EnglishEnabled: false, EnglishViEnabled: true, DefaultDictionary: EnglishVietnamese, DeckName: "Words", MaxLookupWords: 5, RemoveAfterExport: false, RemoveAcknowledged: true}
 	if got := ParseUser(u.JSON()); got != u {
 		t.Fatalf("%+v", got)
 	}
@@ -70,7 +72,7 @@ func TestUserRoundTripAndDefaults(t *testing.T) {
 }
 
 func TestUserValidateAgainstSystem(t *testing.T) {
-	sys := Defaults(100)
+	sys := Defaults(100, 168)
 	u := UserDefaults()
 	if err := u.Validate(sys); err != nil {
 		t.Fatal(err)
@@ -96,10 +98,46 @@ func TestUserValidateAgainstSystem(t *testing.T) {
 }
 
 func TestEffectiveFollowsTheSystem(t *testing.T) {
-	sys := Defaults(100)
+	sys := Defaults(100, 168)
 	sys.EnglishEnabled = false
 	got := UserDefaults().Effective(sys) // English was the default
 	if got.EnglishEnabled || !got.EnglishViEnabled || got.DefaultDictionary != EnglishVietnamese {
 		t.Fatalf("%+v", got)
+	}
+}
+
+func TestRemoveAfterExport(t *testing.T) {
+	// a missing key is on, for the system and for the user
+	if got := FromRows(map[string]json.RawMessage{}, Defaults(100, 168)); !got.RemoveAfterExport || got.ExportedRetentionHours != 168 {
+		t.Fatalf("%+v", got)
+	}
+	if !ParseUser(`{"deckName":"x"}`).RemoveAfterExport {
+		t.Fatal("the user default is on")
+	}
+	if u := ParseUser(`{"removeAfterExport":false}`); u.RemoveAfterExport {
+		t.Fatal("false must stay false")
+	}
+	// retention rows: a valid number is read, a bad one is the default
+	rows := map[string]json.RawMessage{"exported_retention_hours": json.RawMessage(`24`), "remove_after_export": json.RawMessage(`false`)}
+	got := FromRows(rows, Defaults(100, 168))
+	if got.ExportedRetentionHours != 24 || got.RemoveAfterExport {
+		t.Fatalf("%+v", got)
+	}
+	rows["exported_retention_hours"] = json.RawMessage(`0`)
+	if got := FromRows(rows, Defaults(100, 168)); got.ExportedRetentionHours != 168 {
+		t.Fatalf("%+v", got)
+	}
+	// effective = system AND user; Effective keeps the choice of the user, so saving it back does not lose it
+	sys, u := Defaults(100, 168), UserDefaults()
+	if !u.RemovesAfterExport(sys) {
+		t.Fatal("both on")
+	}
+	sys.RemoveAfterExport = false
+	if u.RemovesAfterExport(sys) || !u.Effective(sys).RemoveAfterExport {
+		t.Fatal("the system is off")
+	}
+	sys.RemoveAfterExport, u.RemoveAfterExport = true, false
+	if u.RemovesAfterExport(sys) {
+		t.Fatal("the user is off")
 	}
 }

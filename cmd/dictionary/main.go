@@ -13,8 +13,10 @@ import (
 	"github.com/huponx/dictionary/internal/anki"
 	"github.com/huponx/dictionary/internal/appconfig"
 	"github.com/huponx/dictionary/internal/identityclient"
+	"github.com/huponx/dictionary/internal/imagestore"
 	"github.com/huponx/dictionary/internal/lookup"
 	"github.com/huponx/dictionary/internal/service"
+	"github.com/huponx/dictionary/internal/settings"
 	"github.com/huponx/dictionary/internal/store"
 	"github.com/huponx/gocommon/config"
 	"github.com/huponx/gocommon/grpcclient"
@@ -86,8 +88,15 @@ func main() {
 		grpcserver.WithMaxMsgSize(1<<20, cfg.ExportMaxBytes+maxMessageMargin),
 	)
 	svc := service.New(looker, st, decks, service.Config{
-		MaxSavedWords: cfg.MaxSavedWords, AudioHosts: cfg.Hosts(), DeckLinkTTL: cfg.DeckLinkTTL,
+		MaxSavedWords: cfg.MaxSavedWords, ExportedRetentionHours: int(cfg.ExportedRetention / time.Hour), AudioHosts: cfg.Hosts(), DeckLinkTTL: cfg.DeckLinkTTL,
 	})
+	var files *imagestore.Store
+	if cfg.ImageDir != "" {
+		files = &imagestore.Store{Dir: cfg.ImageDir}
+		svc.WithImages(files, imagestore.Options{MaxBytes: cfg.ImageMaxBytes, MaxDim: cfg.ImageMaxDim, MaxPixels: cfg.ImageMaxPixels}, cfg.ImageUserQuota)
+	} else {
+		log.Warn("DICTIONARY_IMAGE_DIR is not set: the images of the cards are disabled")
+	}
 	if cfg.IdentityAddr != "" {
 		// preferences of the users: identity, called on behalf of the user of the request
 		exch, err := tokenexchange.New(tokenexchange.Config{TokenURL: cfg.TokenURL, ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret})
@@ -117,7 +126,7 @@ func main() {
 		log.Info("dictionary grpc listening", zap.String("addr", cfg.Addr()))
 		errCh <- srv.GRPC.Serve(lis)
 	}()
-	go cleanup(ctx, st, cfg, log)
+	go cleanup(ctx, st, files, cfg, log)
 
 	select {
 	case <-ctx.Done():
@@ -135,19 +144,34 @@ func main() {
 // cleanupBatch is the number of rows one DELETE removes.
 const cleanupBatch = 500
 
-// cleanup deletes the exported words older than the retention, every CleanupInterval, in batches. Several
-// replicas can run it at once.
-func cleanup(ctx context.Context, st *store.Store, cfg appconfig.Dictionary, log *zap.Logger) {
+// retention is how long a word that left the list is kept: the system setting of the administrators, or the
+// default of the configuration (DICTIONARY_EXPORTED_RETENTION) when the settings cannot be read or hold none.
+func retention(ctx context.Context, st *store.Store, cfg appconfig.Dictionary, log *zap.Logger) time.Duration {
+	def := settings.Defaults(cfg.MaxSavedWords, int(cfg.ExportedRetention/time.Hour))
+	rows, err := st.Settings(ctx)
+	if err != nil {
+		log.Warn("read settings for the cleanup, using the default retention", zap.Error(err))
+		return cfg.ExportedRetention
+	}
+	return time.Duration(settings.FromRows(rows, def).ExportedRetentionHours) * time.Hour
+}
+
+// cleanup deletes the words that left the list (an export took them out, or the user chose to remove them)
+// longer ago than the retention, every CleanupInterval, in batches. Words still in the list are never
+// deleted. Several replicas can run it at once.
+func cleanup(ctx context.Context, st *store.Store, files *imagestore.Store, cfg appconfig.Dictionary, log *zap.Logger) {
 	t := time.NewTicker(cfg.CleanupInterval)
 	defer t.Stop()
+	lastSweep := time.Now() // the first sweep of the files is a day after the start
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			var total int64
+			keep := retention(ctx, st, cfg, log)
 			for {
-				n, err := st.DeleteExportedBefore(ctx, time.Now().Add(-cfg.ExportedRetention), cleanupBatch)
+				n, err := st.DeleteRemovedBefore(ctx, time.Now().Add(-keep), cleanupBatch)
 				if err != nil {
 					log.Warn("cleanup exported words", zap.Error(err))
 					break
@@ -160,12 +184,83 @@ func cleanup(ctx context.Context, st *store.Store, cfg appconfig.Dictionary, log
 			if total > 0 {
 				log.Info("exported words deleted", zap.Int64("count", total))
 			}
+			if files != nil {
+				cleanImages(ctx, st, files, log)
+				if time.Since(lastSweep) >= orphanSweepEvery {
+					lastSweep = time.Now()
+					sweepOrphanFiles(ctx, st, files, log)
+				}
+			}
 			if n, err := st.DeleteExpiredDeckLinks(ctx, time.Now()); err != nil {
 				log.Warn("cleanup deck links", zap.Error(err))
 			} else if n > 0 {
 				log.Info("expired deck links deleted", zap.Int64("count", n))
 			}
 		}
+	}
+}
+
+const (
+	// unusedImageAge: an image no card refers to is deleted after this long (an upload comes before the save
+	// of the card that uses it).
+	unusedImageAge = 24 * time.Hour
+	// orphanSweepEvery: how often the volume is compared with the table (files without a row, left by a deleted
+	// user or a failed delete); orphanFileAge protects the files of an upload in progress.
+	orphanSweepEvery = 24 * time.Hour
+	orphanFileAge    = time.Hour
+)
+
+// cleanImages deletes the images no word uses (their rows first, then their files), in batches.
+func cleanImages(ctx context.Context, st *store.Store, files *imagestore.Store, log *zap.Logger) {
+	var total int
+	for {
+		rows, err := st.DeleteUnusedImages(ctx, time.Now().Add(-unusedImageAge), cleanupBatch)
+		if err != nil {
+			log.Warn("cleanup images", zap.Error(err))
+			break
+		}
+		for _, im := range rows {
+			if err := files.Remove(im.UserID, im.ID, imagestore.Ext(im.ContentType)); err != nil {
+				// the row is gone: the sweep of orphan files deletes the file later
+				log.Warn("delete image file", zap.String("id", im.ID), zap.Error(err))
+			}
+		}
+		total += len(rows)
+		if len(rows) < cleanupBatch {
+			break
+		}
+	}
+	if total > 0 {
+		log.Info("unused images deleted", zap.Int("count", total))
+	}
+}
+
+// sweepOrphanFiles deletes the files of the volume that have no row.
+func sweepOrphanFiles(ctx context.Context, st *store.Store, files *imagestore.Store, log *zap.Logger) {
+	users, err := files.Users()
+	if err != nil {
+		log.Warn("sweep image files", zap.Error(err))
+		return
+	}
+	var total int
+	for _, u := range users {
+		if ctx.Err() != nil {
+			return
+		}
+		n, err := files.Orphans(u, orphanFileAge, cleanupBatch, func(fs []imagestore.File) (map[string]bool, error) {
+			ids := make([]string, len(fs))
+			for i, f := range fs {
+				ids[i] = f.ID
+			}
+			return st.ExistingImageIDs(ctx, ids)
+		})
+		total += n
+		if err != nil {
+			log.Warn("sweep image files", zap.String("user", u), zap.Error(err))
+		}
+	}
+	if total > 0 {
+		log.Info("orphan image files deleted", zap.Int("count", total))
 	}
 }
 
