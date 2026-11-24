@@ -25,14 +25,15 @@ One process, `cmd/dictionary`, gRPC only. It never sees a password or a session:
 | --- | --- | --- |
 | `LookupWord` | `dictionary:word:read` | Entry of one word in `DICTIONARY_ENGLISH` (default) or `DICTIONARY_ENGLISH_VIETNAMESE` |
 | `LookupWords` | `dictionary:word:read` | 1 to 20 words; words without an entry come back in `not_found` |
-| `ListSavedWords` | `dictionary:word:read` | Pending saved words, newest first, token pagination (`page_size`, `page_token`) |
-| `SaveWord` | `dictionary:word:write` | Adds or refreshes a pending word (word, card back HTML, audio URLs) |
-| `DeleteSavedWord` | `dictionary:word:write` | Removes a pending word |
-| `ExportAnki` | `dictionary:word:write` | Builds the `.apkg` of the pending words, returns its bytes and starts a new batch |
+| `ListSavedWords` | `dictionary:word:read` | The words of the list (new ones and exported ones that were kept), newest first, with `exported` per word, `total` and `new_total`; token pagination (`page_size`, `page_token`) |
+| `SaveWord` | `dictionary:word:write` | Adds or refreshes a word of the list (word, card back HTML, audio URLs); an exported word is new again |
+| `DeleteSavedWord` | `dictionary:word:write` | Removes a word of the list |
+| `RemoveExportedWords` | `dictionary:word:write` | Takes the exported words out of the list (the new ones stay); returns the count. Called by the dict app when the user answers "Remove them" |
+| `ExportAnki` | `dictionary:word:write` | Builds the `.apkg` of the new words (`scope` `EXPORT_SCOPE_NEW`, the default) or of the whole list (`EXPORT_SCOPE_ALL`), returns its bytes and marks the words exported; with remove after export they also leave the list |
 | `CreateDeckLink` | `dictionary:word:write` | Same as `ExportAnki`, but keeps the deck behind a random token (see "Download link") and returns the token |
-| `GetSettings` | `dictionary:settings:read` | Settings of the system (max saved words, export as deck, export as link, English, English-Vietnamese) |
+| `GetSettings` | `dictionary:settings:read` | Settings of the system (max saved words, export as deck, export as link, English, English-Vietnamese, remove after export, retention hours) |
 | `UpdateSettings` | `dictionary:settings:write` | Replaces them; only the values that changed are written; at least one dictionary stays on |
-| `GetMySettings` | `dictionary:word:read` | Preferences of the user (enabled dictionaries, default dictionary, default deck name, words per lookup) next to the system settings; the defaults when identity is down |
+| `GetMySettings` | `dictionary:word:read` | Preferences of the user (enabled dictionaries, default dictionary, default deck name, words per lookup, remove after export, whether the remove/keep question was answered) next to the system settings; the defaults when identity is down |
 | `UpdateMySettings` | `dictionary:word:read` | Stores the preferences in identity (validated against the system settings) |
 | `DownloadDeck` | any authenticated caller, **service token only** | Returns the deck of a token and deletes it; called by gatekeeper for the anonymous download |
 
@@ -44,8 +45,8 @@ Errors a client may want to recognize start with a code in the message: `MAX_SAV
 
 Two kinds, both optional to set (a missing value is the default, so a new setting needs no migration):
 
-- **System settings**, edited by an administrator (admin app, page Dictionary): rows `key` / `value jsonb` of `dictionary_settings` (migration `V18`). Keys: `max_saved_words` (1 to 1000, default `DICTIONARY_MAX_SAVED_WORDS`), `allow_export_deck`, `allow_export_link`, `english_enabled`, `english_vi_enabled` (default on; at least one dictionary stays on). They are enforced here: `SaveWord` uses the stored maximum (words above a lowered maximum stay, only a new save is refused), `ExportAnki` / `CreateDeckLink` answer `FEATURE_DISABLED` when off, a lookup in a turned off dictionary answers `DICTIONARY_DISABLED`.
-- **Preferences of a user** (dict app, page Settings): one JSON object for the application `dictionary` in `identity_user_settings`, which identity owns. Dictionary calls `GetMyUserSettings` / `PutMyUserSettings` of identity on behalf of the user: it exchanges the token of the request for one with the audience `DICTIONARY_IDENTITY_AUDIENCE` (RFC 8693, `gocommon/tokenexchange`) and calls `DICTIONARY_IDENTITY_ADDR`. The preferences narrow what the system allows; the web app applies them (enabled and default dictionary, deck name, words per lookup), the server only validates them. If identity is down `GetMySettings` answers with the defaults.
+- **System settings**, edited by an administrator (admin app, page Dictionary): rows `key` / `value jsonb` of `dictionary_settings` (migration `V18`). Keys: `max_saved_words` (1 to 1000, default `DICTIONARY_MAX_SAVED_WORDS`), `allow_export_deck`, `allow_export_link`, `english_enabled`, `english_vi_enabled` (default on; at least one dictionary stays on), `remove_after_export` (default on, see "Saved words and export batches") and `exported_retention_hours` (1 to 8760, default `DICTIONARY_EXPORTED_RETENTION`). They are enforced here: `SaveWord` uses the stored maximum (words above a lowered maximum stay, only a new save is refused), `ExportAnki` / `CreateDeckLink` answer `FEATURE_DISABLED` when off, a lookup in a turned off dictionary answers `DICTIONARY_DISABLED`.
+- **Preferences of a user** (dict app, page Settings): one JSON object for the application `dictionary` in `identity_user_settings`, which identity owns. Dictionary calls `GetMyUserSettings` / `PutMyUserSettings` of identity on behalf of the user: it exchanges the token of the request for one with the audience `DICTIONARY_IDENTITY_AUDIENCE` (RFC 8693, `gocommon/tokenexchange`) and calls `DICTIONARY_IDENTITY_ADDR`. The preferences narrow what the system allows; the web app applies them (enabled and default dictionary, deck name, words per lookup), the server only validates them. The exception is `removeAfterExport`, which the server reads at export time (effective value = system AND user; identity down means the default, remove). `removeAcknowledged` is only kept for the dict app. If identity is down `GetMySettings` answers with the defaults.
 
 ## Lookup sources
 
@@ -69,10 +70,10 @@ Cambridge answers 403 behind Cloudflare, so nothing is scraped from it. The entr
 
 `dictionary_saved_words` (migration `V15__dictionary_saved_words.sql`) holds one row per user and word.
 
-- A row is **pending** while `exported_at` is `NULL`. The pending rows are the next export and count against `DICTIONARY_MAX_SAVED_WORDS` (default 100). Saving a pending word again overwrites it (card, audio and save time, so it moves to the top of the list); the limit is checked under a per-user advisory lock, so parallel saves cannot pass it.
-- `ExportAnki` reads the pending words (oldest first, one card each: the word on the front, the saved HTML on the back), builds the deck and then sets `exported_at = now()` on exactly those rows. That starts a new batch: the pending count is back to 0. A deck that fails or is too large leaves the words pending. Words saved while the deck was built stay pending.
-- Saving a word that was already exported makes it pending again.
-- Exported rows are kept for `DICTIONARY_EXPORTED_RETENTION` (default `168h`, 7 days) and then deleted by a cleanup that runs inside the service every `DICTIONARY_CLEANUP_INTERVAL` (default `1h`), in batches of 500 rows with `FOR UPDATE SKIP LOCKED`, so several replicas can run it. There is no API to export an old batch again; the retention only covers a response that got lost.
+- Two timestamps: `exported_at` (the word was packed in a deck; `NULL` means new) and `removed_at` (the word left the list; `NULL` means it is in the list; migration `V20`). The words with `removed_at` `NULL` are the list: they count against `DICTIONARY_MAX_SAVED_WORDS` (default 100) and `ListSavedWords` returns them. Saving a word again overwrites it (card, audio and save time, so it moves to the top of the list) and makes it new again (both timestamps cleared); the limit is checked under a per-user advisory lock, so parallel saves cannot pass it.
+- `ExportAnki` / `CreateDeckLink` read the new words (`scope` NEW, the default) or the whole list (`scope` ALL), oldest first, one card each: the word on the front, the saved HTML on the back. They build the deck and then set `exported_at = now()` on exactly those rows, and `removed_at = now()` too when remove after export is in effect. A deck that fails or is too large changes nothing. Words saved while the deck was built are not touched. With nothing new and `scope` NEW the answer is `NO_WORDS_TO_EXPORT`.
+- **Remove after export** is the system setting `remove_after_export` AND the preference `removeAfterExport` of the user (both default on). Off: exported words stay in the list, flagged `exported`, and the user chooses "export all" or "export new only" the next time. When it comes on again (an administrator or the user), the dict app asks once whether to remove the exported words that are still in the list (`RemoveExportedWords`) or keep them.
+- Rows that left the list are kept for the system setting `exported_retention_hours` (default `DICTIONARY_EXPORTED_RETENTION`, `168h`, 7 days; 1 to 8760 hours) and then deleted by a cleanup that runs inside the service every `DICTIONARY_CLEANUP_INTERVAL` (default `1h`), in batches of 500 rows with `FOR UPDATE SKIP LOCKED`, so several replicas can run it. It reads the setting on every run and never deletes a word that is in the list. There is no API to export an old batch again; the retention only covers a response that got lost.
 - The card back may contain the placeholders `replace_audio_uk` and `replace_audio_us`: in the deck they become sound tags of the downloaded files (or nothing when a file could not be downloaded).
 
 Audio files are downloaded by the service when it builds a deck, so the URLs a client saves are restricted: `https` and a host of `DICTIONARY_AUDIO_HOSTS` (default `api.dictionaryapi.dev`, `upload.wikimedia.org`, `ssl.gstatic.com`), checked at save time, again at download time and on every redirect. Files are at most 512 KiB, the downloads of one deck share a 20 second budget, and a file that fails is left out without failing the export.
@@ -132,9 +133,14 @@ All settings are environment variables (see `.env.example`).
 | `DICTIONARY_MAX_SAVED_WORDS` | `100` | Default of the setting "max saved words" (1 to 1000); the value an administrator saved wins |
 | `DICTIONARY_EXPORT_MAX_BYTES` | `3145728` | Largest `.apkg`; also the gRPC send limit |
 | `DICTIONARY_DECK_LINK_TTL` | `15m` | How long a download link works (1m to 24h) |
-| `DICTIONARY_EXPORTED_RETENTION` | `168h` | How long exported rows are kept (at least `1h`) |
+| `DICTIONARY_EXPORTED_RETENTION` | `168h` | Default of the system setting "keep removed words for": how long rows that left the list are kept (`1h` to `8760h`) |
 | `DICTIONARY_CLEANUP_INTERVAL` | `1h` | Period of the cleanup (at least `1m`) |
 | `DICTIONARY_AUDIO_HOSTS` | `api.dictionaryapi.dev,upload.wikimedia.org,ssl.gstatic.com` | Allowed hosts of audio URLs; comma or one per line |
+| `DICTIONARY_IMAGE_DIR` | empty | Directory of the card images (`<dir>/<user>/<id>.<ext>`); empty turns the image RPCs off. In Kubernetes it is the PVC `dictionary-images` mounted at `/data/images` |
+| `DICTIONARY_IMAGE_MAX_BYTES` | `307200` | Largest stored image (after the resize and re-encoding) |
+| `DICTIONARY_IMAGE_MAX_DIM` | `1024` | Longest side in pixels; larger images are scaled down |
+| `DICTIONARY_IMAGE_MAX_PIXELS` | `25000000` | Uploads with more pixels are refused before they are decoded |
+| `DICTIONARY_IMAGE_USER_QUOTA` | `20971520` | Bytes of images one user may keep |
 | `DICTIONARY_LOOKUP_CACHE_TTL` / `SIZE` | `24h` / `2000` | In-memory cache of entries; `0` turns it off |
 | `DICTIONARY_HTTP_TIMEOUT` | `10s` | One call to a provider or an audio file |
 | `DICTIONARY_USER_AGENT` | `huponx-dictionary/1.0 (+https://github.com/huponx/dictionary)` | Sent to the providers |
@@ -145,6 +151,7 @@ All settings are environment variables (see `.env.example`).
 
 - gRPC health on the API port (`grpcserver` health is on by default, no token required for `/grpc.health.v1.Health`); the chart probes the TCP port like courier.
 - The pod is read-only apart from `/tmp` (an `emptyDir` in the chart): the Anki library writes the deck through a temporary SQLite file.
+- The card images are files in `DICTIONARY_IMAGE_DIR`: the chart mounts the PVC `dictionary-images` at `/data/images` and sets `fsGroup: 65532` so uid 65532 can write to it. The claim is not part of the chart: mm-ansible creates it (`playbooks/cluster.yml --tags pvc`), and it must exist before the pod starts, or the pod stays `Pending`. It lives outside ArgoCD, so deleting the Application keeps the images. ReadWriteOnce hostpath only works on a one-node cluster (also with the HPA): with more nodes switch to a ReadWriteMany class or object storage. `ci/full-values.yaml` uses an `emptyDir` instead of the claim.
 - The only caller is gatekeeper: there is no Ingress, only the Service `dictionary:9090` of the namespace `application`.
 - It reads two things outside the cluster network: the dictionary APIs and the audio hosts (HTTPS egress).
 

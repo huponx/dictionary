@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/huponx/dictionary/internal/anki"
+	"github.com/huponx/dictionary/internal/cardref"
 	"github.com/huponx/dictionary/internal/lookup"
 	"github.com/huponx/dictionary/internal/store"
 	"github.com/huponx/gocommon/authn"
@@ -82,12 +83,14 @@ func (f fakeLooker) LookupMany(ctx context.Context, d lookup.Dictionary, words [
 }
 
 type fakeStore struct {
-	rows     map[string]store.SavedWord // pending words of the user
-	exported map[string]bool
-	clock    time.Time
-	failMark bool
-	links    map[string]store.DeckLink // by hash of the token
-	settings map[string]json.RawMessage
+	rows       map[string]store.SavedWord // pending words of the user
+	exported   map[string]bool
+	clock      time.Time
+	failMark   bool
+	lastRemove bool                      // the remove argument of the last MarkExported
+	links      map[string]store.DeckLink // by hash of the token
+	settings   map[string]json.RawMessage
+	images     map[string]store.Image // by id
 }
 
 func (f *fakeStore) Settings(context.Context) (map[string]json.RawMessage, error) {
@@ -112,7 +115,12 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{rows: map[string]store.SavedWord{}, exported: map[string]bool{}, links: map[string]store.DeckLink{}, clock: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 }
 
-func (f *fakeStore) SaveWord(_ context.Context, _ string, w store.SavedWord, max int) (int, error) {
+func (f *fakeStore) SaveWord(_ context.Context, user string, w store.SavedWord, max int) (int, error) {
+	for _, id := range cardref.IDs(w.Content) {
+		if im, ok := f.images[id]; !ok || im.UserID != user {
+			return 0, store.ErrUnknownImage
+		}
+	}
 	if _, ok := f.rows[w.Word]; !ok && len(f.rows) >= max {
 		return 0, store.ErrLimit
 	}
@@ -121,7 +129,15 @@ func (f *fakeStore) SaveWord(_ context.Context, _ string, w store.SavedWord, max
 	f.rows[w.Word] = w
 	return len(f.rows), nil
 }
-func (f *fakeStore) CountPending(context.Context, string) (int, error) { return len(f.rows), nil }
+func (f *fakeStore) CountPending(context.Context, string) (int, int, error) {
+	fresh := 0
+	for _, r := range f.rows {
+		if !r.Exported {
+			fresh++
+		}
+	}
+	return len(f.rows), fresh, nil
+}
 func (f *fakeStore) sorted() []store.SavedWord {
 	var out []store.SavedWord
 	for _, r := range f.rows {
@@ -144,8 +160,14 @@ func (f *fakeStore) ListPending(_ context.Context, _ string, after time.Time, af
 	}
 	return out, nil
 }
-func (f *fakeStore) Pending(context.Context, string) ([]store.SavedWord, error) {
-	return f.sorted(), nil
+func (f *fakeStore) Pending(_ context.Context, _ string, scope store.Scope) ([]store.SavedWord, error) {
+	var out []store.SavedWord
+	for _, r := range f.sorted() {
+		if scope == store.ScopeAll || !r.Exported {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 func (f *fakeStore) DeletePending(_ context.Context, _, word string) error {
 	if _, ok := f.rows[word]; !ok {
@@ -154,15 +176,31 @@ func (f *fakeStore) DeletePending(_ context.Context, _, word string) error {
 	delete(f.rows, word)
 	return nil
 }
-func (f *fakeStore) MarkExported(_ context.Context, _ string, words []string) (int64, error) {
+func (f *fakeStore) MarkExported(_ context.Context, _ string, words []string, remove bool) (int64, error) {
 	if f.failMark {
 		return 0, errors.New("db down")
 	}
+	f.lastRemove = remove
 	for _, w := range words {
-		delete(f.rows, w)
+		if remove {
+			delete(f.rows, w)
+		} else if r, ok := f.rows[w]; ok {
+			r.Exported = true
+			f.rows[w] = r
+		}
 		f.exported[w] = true
 	}
 	return int64(len(words)), nil
+}
+func (f *fakeStore) RemoveExported(context.Context, string) (int64, error) {
+	var n int64
+	for w, r := range f.rows {
+		if r.Exported {
+			delete(f.rows, w)
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (f *fakeStore) PutDeckLink(_ context.Context, _ string, h []byte, l store.DeckLink) error {
@@ -178,6 +216,49 @@ func (f *fakeStore) TakeDeckLink(_ context.Context, h []byte, now time.Time) (*s
 	return &l, nil
 }
 
+func (f *fakeStore) ImageBytes(_ context.Context, user string) (int64, error) {
+	var n int64
+	for _, im := range f.images {
+		if im.UserID == user {
+			n += int64(im.Size)
+		}
+	}
+	return n, nil
+}
+func (f *fakeStore) ImageBySHA(_ context.Context, user string, sha []byte) (*store.Image, error) {
+	for _, im := range f.images {
+		if im.UserID == user && string(im.SHA256) == string(sha) {
+			return &im, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+func (f *fakeStore) GetImage(_ context.Context, user, id string) (*store.Image, error) {
+	if im, ok := f.images[id]; ok && im.UserID == user {
+		return &im, nil
+	}
+	return nil, store.ErrNotFound
+}
+func (f *fakeStore) ImagesByIDs(_ context.Context, user string, ids []string) ([]store.Image, error) {
+	var out []store.Image
+	for _, id := range ids {
+		if im, ok := f.images[id]; ok && im.UserID == user {
+			out = append(out, im)
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) InsertImage(ctx context.Context, im store.Image) (*store.Image, bool, error) {
+	if ex, err := f.ImageBySHA(ctx, im.UserID, im.SHA256); err == nil {
+		return ex, false, nil
+	}
+	if f.images == nil {
+		f.images = map[string]store.Image{}
+	}
+	f.images[im.ID] = im
+	return &im, true, nil
+}
+
 type fakeDecks struct {
 	err   error
 	built []anki.Word
@@ -190,7 +271,7 @@ func (f *fakeDecks) Build(_ context.Context, _ string, w []anki.Word) ([]byte, e
 
 func newService(st *fakeStore, d *fakeDecks) *Service {
 	return New(fakeLooker{words: map[string]*lookup.Word{"hello": {Text: "hello", Meanings: []lookup.Meaning{{Definition: "a greeting", MachineTranslated: true}}}}},
-		st, d, Config{MaxSavedWords: 3, AudioHosts: []string{"api.dictionaryapi.dev"}})
+		st, d, Config{MaxSavedWords: 3, ExportedRetentionHours: 168, AudioHosts: []string{"api.dictionaryapi.dev"}})
 }
 
 func TestUserIDRules(t *testing.T) {

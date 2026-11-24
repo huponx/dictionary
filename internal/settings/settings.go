@@ -18,6 +18,8 @@ const App = "dictionary"
 const (
 	MaxSavedWordsLimit = 1000
 	MaxLookupLimit     = 20
+	// MaxRetentionHours is one year.
+	MaxRetentionHours = 8760
 )
 
 // Keys of the rows of dictionary_settings.
@@ -27,6 +29,9 @@ const (
 	keyExportLink = "allow_export_link"
 	keyEnglish    = "english_enabled"
 	keyEnglishVi  = "english_vi_enabled"
+
+	keyRemoveAfterExport = "remove_after_export"
+	keyRetentionHours    = "exported_retention_hours"
 )
 
 // Dictionary names used in the preferences.
@@ -42,11 +47,18 @@ type System struct {
 	AllowExportLink  bool
 	EnglishEnabled   bool
 	EnglishViEnabled bool
+	// RemoveAfterExport: an export takes the words out of the list (a user can turn it off for themself).
+	RemoveAfterExport bool
+	// ExportedRetentionHours is how long a word that left the list is kept before the cleanup deletes it.
+	ExportedRetentionHours int
 }
 
 // Defaults are the settings of a system nobody changed: everything on.
-func Defaults(maxSaved int) System {
-	return System{MaxSavedWords: maxSaved, AllowExportDeck: true, AllowExportLink: true, EnglishEnabled: true, EnglishViEnabled: true}
+func Defaults(maxSaved, retentionHours int) System {
+	return System{
+		MaxSavedWords: maxSaved, AllowExportDeck: true, AllowExportLink: true, EnglishEnabled: true, EnglishViEnabled: true,
+		RemoveAfterExport: true, ExportedRetentionHours: retentionHours,
+	}
 }
 
 // Enabled reports whether a dictionary ("english", "english_vi") can be looked up.
@@ -65,6 +77,9 @@ func (s System) Validate() error {
 	if s.MaxSavedWords < 1 || s.MaxSavedWords > MaxSavedWordsLimit {
 		return fmt.Errorf("max saved words must be between 1 and %d", MaxSavedWordsLimit)
 	}
+	if s.ExportedRetentionHours < 1 || s.ExportedRetentionHours > MaxRetentionHours {
+		return fmt.Errorf("retention must be between 1 and %d hours", MaxRetentionHours)
+	}
 	if !s.EnglishEnabled && !s.EnglishViEnabled {
 		return errors.New("at least one dictionary must stay enabled")
 	}
@@ -81,9 +96,16 @@ func FromRows(rows map[string]json.RawMessage, def System) System {
 			out.MaxSavedWords = n
 		}
 	}
+	if v, ok := rows[keyRetentionHours]; ok {
+		var n int
+		if json.Unmarshal(v, &n) == nil && n >= 1 && n <= MaxRetentionHours {
+			out.ExportedRetentionHours = n
+		}
+	}
 	for key, dst := range map[string]*bool{
 		keyExportDeck: &out.AllowExportDeck, keyExportLink: &out.AllowExportLink,
 		keyEnglish: &out.EnglishEnabled, keyEnglishVi: &out.EnglishViEnabled,
+		keyRemoveAfterExport: &out.RemoveAfterExport,
 	} {
 		if v, ok := rows[key]; ok {
 			var b bool
@@ -100,6 +122,7 @@ func (s System) rows() map[string]json.RawMessage {
 	return map[string]json.RawMessage{
 		keyMaxSaved: enc(s.MaxSavedWords), keyExportDeck: enc(s.AllowExportDeck), keyExportLink: enc(s.AllowExportLink),
 		keyEnglish: enc(s.EnglishEnabled), keyEnglishVi: enc(s.EnglishViEnabled),
+		keyRemoveAfterExport: enc(s.RemoveAfterExport), keyRetentionHours: enc(s.ExportedRetentionHours),
 	}
 }
 
@@ -123,11 +146,17 @@ type User struct {
 	DefaultDictionary string
 	DeckName          string
 	MaxLookupWords    int
+	// RemoveAfterExport: an export takes the words out of the list (needs the system setting too).
+	RemoveAfterExport bool
+	// RemoveAcknowledged: remove after export is in effect and the user answered what to do with the words that
+	// were exported earlier and are still in the list. It is cleared when the setting goes off, so the question
+	// comes again the next time it is on.
+	RemoveAcknowledged bool
 }
 
 // UserDefaults are the preferences of a user who never chose: everything on, English first.
 func UserDefaults() User {
-	return User{EnglishEnabled: true, EnglishViEnabled: true, DefaultDictionary: English, MaxLookupWords: MaxLookupLimit}
+	return User{EnglishEnabled: true, EnglishViEnabled: true, DefaultDictionary: English, MaxLookupWords: MaxLookupLimit, RemoveAfterExport: true}
 }
 
 // userJSON is what is stored; a pointer tells a missing key from a false one.
@@ -137,6 +166,9 @@ type userJSON struct {
 	DefaultDictionary string `json:"defaultDictionary,omitempty"`
 	DeckName          string `json:"deckName,omitempty"`
 	MaxLookupWords    int    `json:"maxLookupWords,omitempty"`
+
+	RemoveAfterExport  *bool `json:"removeAfterExport,omitempty"`
+	RemoveAcknowledged bool  `json:"removeAcknowledged,omitempty"`
 }
 
 // ParseUser reads the stored object; anything missing or unreadable keeps the default.
@@ -155,6 +187,10 @@ func ParseUser(raw string) User {
 	if j.DefaultDictionary == English || j.DefaultDictionary == EnglishVietnamese {
 		out.DefaultDictionary = j.DefaultDictionary
 	}
+	if j.RemoveAfterExport != nil {
+		out.RemoveAfterExport = *j.RemoveAfterExport
+	}
+	out.RemoveAcknowledged = j.RemoveAcknowledged
 	out.DeckName = j.DeckName
 	if j.MaxLookupWords >= 1 && j.MaxLookupWords <= MaxLookupLimit {
 		out.MaxLookupWords = j.MaxLookupWords
@@ -167,6 +203,7 @@ func (u User) JSON() string {
 	b, _ := json.Marshal(userJSON{
 		EnglishEnabled: &u.EnglishEnabled, EnglishViEnabled: &u.EnglishViEnabled,
 		DefaultDictionary: u.DefaultDictionary, DeckName: u.DeckName, MaxLookupWords: u.MaxLookupWords,
+		RemoveAfterExport: &u.RemoveAfterExport, RemoveAcknowledged: u.RemoveAcknowledged,
 	})
 	return string(b)
 }
@@ -180,6 +217,12 @@ func (u User) Allows(sys System, dictionary string) bool {
 		return u.EnglishViEnabled && sys.EnglishViEnabled
 	}
 	return false
+}
+
+// RemovesAfterExport reports whether an export takes the words out of the list: the system allows it and the
+// user did not turn it off.
+func (u User) RemovesAfterExport(sys System) bool {
+	return u.RemoveAfterExport && sys.RemoveAfterExport
 }
 
 // Validate checks what a user sends against what the system allows: one dictionary at least, and the default
