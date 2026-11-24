@@ -146,11 +146,14 @@ func (f *fakeStore) sorted() []store.SavedWord {
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out
 }
-func (f *fakeStore) ListPending(_ context.Context, _ string, after time.Time, afterWord string, limit int) ([]store.SavedWord, error) {
+func (f *fakeStore) ListPending(_ context.Context, _ string, after time.Time, afterWord, query string, limit int) ([]store.SavedWord, error) {
 	all := f.sorted()
 	var out []store.SavedWord
 	for i := len(all) - 1; i >= 0; i-- { // newest first
 		if afterWord != "" && !all[i].CreatedAt.Before(after) {
+			continue
+		}
+		if query != "" && !strings.Contains(strings.ToLower(all[i].Word), strings.ToLower(query)) {
 			continue
 		}
 		out = append(out, all[i])
@@ -262,10 +265,12 @@ func (f *fakeStore) InsertImage(ctx context.Context, im store.Image) (*store.Ima
 type fakeDecks struct {
 	err   error
 	built []anki.Word
+	fresh bool
 }
 
-func (f *fakeDecks) Build(_ context.Context, _ string, w []anki.Word) ([]byte, error) {
+func (f *fakeDecks) Build(_ context.Context, _ string, w []anki.Word, fresh bool) ([]byte, error) {
 	f.built = w
+	f.fresh = fresh
 	return []byte("apkg"), f.err
 }
 
@@ -357,6 +362,46 @@ func TestSaveWord(t *testing.T) {
 	}
 	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "one", AudioUs: "https://api.dictionaryapi.dev/m/one-us.mp3"}); err != nil {
 		t.Errorf("an allowed audio host: %v", err)
+	}
+}
+
+func TestListSavedWordsQuery(t *testing.T) {
+	st := newFakeStore()
+	s := newService(st, &fakeDecks{})
+	s.cfg.MaxSavedWords = 10
+	for _, w := range []string{"apple", "Pineapple", "banana", "grape", "apply"} {
+		if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: w}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	words := func(r *dictionaryv1.ListSavedWordsResponse) string {
+		var out []string
+		for _, w := range r.Words {
+			out = append(out, w.Word)
+		}
+		return strings.Join(out, ",")
+	}
+	r, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Query: "  APP "})
+	if err != nil || words(r) != "apply,pineapple,apple" {
+		t.Fatalf("substring, any case: %q, %v", words(r), err)
+	}
+	if r.Total != 5 {
+		t.Errorf("total = %d, want the unfiltered 5", r.Total)
+	}
+	// pages keep working with a query
+	r, err = s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Query: "app", PageSize: 2})
+	if err != nil || words(r) != "apply,pineapple" || r.NextPageToken == "" {
+		t.Fatalf("page 1: %q token=%q %v", words(r), r.NextPageToken, err)
+	}
+	r, err = s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Query: "app", PageSize: 2, PageToken: r.NextPageToken})
+	if err != nil || words(r) != "apple" || r.NextPageToken != "" {
+		t.Fatalf("page 2: %q token=%q %v", words(r), r.NextPageToken, err)
+	}
+	if r, _ = s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Query: "%"}); len(r.Words) != 0 {
+		t.Errorf("%% is a plain character, got %q", words(r))
+	}
+	if _, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Query: strings.Repeat("a", 101)}); code(err) != codes.InvalidArgument {
+		t.Errorf("long query: %v", err)
 	}
 }
 

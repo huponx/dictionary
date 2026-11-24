@@ -61,9 +61,12 @@ func TestUserRoundTripAndDefaults(t *testing.T) {
 	if got := ParseUser("{not json"); got != UserDefaults() {
 		t.Fatalf("%+v", got)
 	}
-	u := User{EnglishEnabled: false, EnglishViEnabled: true, DefaultDictionary: EnglishVietnamese, DeckName: "Words", MaxLookupWords: 5, RemoveAfterExport: false, RemoveAcknowledged: true}
+	u := User{EnglishEnabled: false, EnglishViEnabled: true, DefaultDictionary: EnglishVietnamese, DeckName: "Words", MaxLookupWords: 5, RemoveAfterExport: false, RemoveAcknowledged: true, FreshDeck: true}
 	if got := ParseUser(u.JSON()); got != u {
 		t.Fatalf("%+v", got)
+	}
+	if UserDefaults().FreshDeck || ParseUser(`{"deckName":"x"}`).FreshDeck {
+		t.Fatal("a deck is not fresh unless the user chose it")
 	}
 	// a missing key is the default, not false
 	if got := ParseUser(`{"deckName":"x"}`); !got.EnglishEnabled || got.DeckName != "x" || got.MaxLookupWords != MaxLookupLimit {

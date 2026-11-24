@@ -205,3 +205,32 @@ func TestMySettingsNeedAUser(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+func TestFreshDeckPreference(t *testing.T) {
+	for raw, want := range map[string]bool{"": false, `{"deckName":"x"}`: false, `{"freshDeck":true}`: true} {
+		decks := &fakeDecks{}
+		s := newService(newFakeStore(), decks).WithPrefs(&fakePrefs{raw: raw})
+		saveWords(t, s, "one")
+		if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{}); err != nil {
+			t.Fatal(err)
+		}
+		if decks.fresh != want {
+			t.Errorf("prefs %q: fresh = %v, want %v", raw, decks.fresh, want)
+		}
+	}
+
+	// the preference is stored and read back through the settings calls
+	p := &fakePrefs{}
+	s := newService(newFakeStore(), &fakeDecks{}).WithPrefs(p)
+	put := &dictionaryv1.UpdateMySettingsRequest{User: &dictionaryv1.UserSettings{EnglishEnabled: true, MaxLookupWords: 5, FreshDeck: true}}
+	if r, err := s.UpdateMySettings(userCtx(), put); err != nil || !r.User.FreshDeck {
+		t.Fatalf("%+v, %v", r, err)
+	}
+	if !settings.ParseUser(p.written).FreshDeck {
+		t.Fatalf("not stored: %s", p.written)
+	}
+	p.raw = p.written
+	if r, err := s.GetMySettings(userCtx(), &dictionaryv1.GetMySettingsRequest{}); err != nil || !r.User.FreshDeck {
+		t.Fatalf("%+v, %v", r, err)
+	}
+}

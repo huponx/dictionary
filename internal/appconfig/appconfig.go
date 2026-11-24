@@ -74,6 +74,13 @@ type Dictionary struct {
 	ImageMaxPixels int    `env:"DICTIONARY_IMAGE_MAX_PIXELS" envDefault:"25000000"`
 	ImageUserQuota int64  `env:"DICTIONARY_IMAGE_USER_QUOTA" envDefault:"20971520"`
 
+	// An image no card refers to is deleted after UnusedImageAge (an upload comes before the save of the card
+	// that uses it). Every OrphanSweepEvery the volume is compared with the table to delete the files without a
+	// row (left by a deleted user or a failed delete); OrphanFileAge protects the files of an upload in progress.
+	UnusedImageAge   time.Duration `env:"DICTIONARY_UNUSED_IMAGE_AGE" envDefault:"24h"`
+	OrphanSweepEvery time.Duration `env:"DICTIONARY_ORPHAN_SWEEP_EVERY" envDefault:"24h"`
+	OrphanFileAge    time.Duration `env:"DICTIONARY_ORPHAN_FILE_AGE" envDefault:"1h"`
+
 	// Base URLs of the providers (overridden in tests).
 	FreeDictURL   string `env:"DICTIONARY_FREEDICT_URL" envDefault:"https://api.dictionaryapi.dev/api/v2/entries/en"`
 	WiktionaryURL string `env:"DICTIONARY_WIKTIONARY_URL" envDefault:"https://vi.wiktionary.org/w/api.php"`
@@ -151,6 +158,15 @@ func (c Dictionary) Validate() error {
 	}
 	if c.ImageUserQuota < int64(c.ImageMaxBytes) {
 		return fmt.Errorf("DICTIONARY_IMAGE_USER_QUOTA must be at least DICTIONARY_IMAGE_MAX_BYTES")
+	}
+	if c.UnusedImageAge < time.Hour {
+		return fmt.Errorf("DICTIONARY_UNUSED_IMAGE_AGE must be at least 1h (an upload comes before the save of its card)")
+	}
+	if c.OrphanSweepEvery < time.Minute {
+		return fmt.Errorf("DICTIONARY_ORPHAN_SWEEP_EVERY must be at least 1m")
+	}
+	if c.OrphanFileAge < 10*time.Minute {
+		return fmt.Errorf("DICTIONARY_ORPHAN_FILE_AGE must be at least 10m (it protects an upload in progress)")
 	}
 	if len(c.Hosts()) == 0 {
 		return fmt.Errorf("DICTIONARY_AUDIO_HOSTS must list at least one host")

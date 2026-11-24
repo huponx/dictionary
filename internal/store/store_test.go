@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// These tests need the schema of db-migration (V15, V20 and V21). Set DICTIONARY_TEST_POSTGRES_URL, for example
+// These tests need the schema of db-migration (V15, V20, V21 and V22). Set DICTIONARY_TEST_POSTGRES_URL, for example
 // postgres://postgres:postgres@localhost:5432/app?sslmode=disable (the database of `make up` in db-migration).
 func testStore(t *testing.T) (*Store, string) {
 	t.Helper()
@@ -52,12 +52,12 @@ func TestSaveListExportCycle(t *testing.T) {
 	}
 
 	// newest first, in pages of 2, with the keyset; the overwritten beta is the newest now
-	page1, err := s.ListPending(ctx, user, time.Time{}, "", 2)
+	page1, err := s.ListPending(ctx, user, time.Time{}, "", "", 2)
 	if err != nil || len(page1) != 2 || page1[0].Word != "beta" || page1[1].Word != "gamma" {
 		t.Fatalf("page 1: %+v, %v", page1, err)
 	}
 	last := page1[1]
-	page2, err := s.ListPending(ctx, user, last.CreatedAt, last.Word, 2)
+	page2, err := s.ListPending(ctx, user, last.CreatedAt, last.Word, "", 2)
 	if err != nil || len(page2) != 1 || page2[0].Word != "alpha" {
 		t.Fatalf("page 2: %+v, %v", page2, err)
 	}
@@ -141,7 +141,7 @@ func TestExportKeepsWordsInTheList(t *testing.T) {
 	if total, fresh := count(t, s, user); total != 3 || fresh != 1 {
 		t.Errorf("total=%d new=%d, want 3 and 1", total, fresh)
 	}
-	list, err := s.ListPending(ctx, user, time.Time{}, "", 10)
+	list, err := s.ListPending(ctx, user, time.Time{}, "", "", 10)
 	if err != nil || len(list) != 3 {
 		t.Fatalf("list: %+v %v", list, err)
 	}
@@ -335,5 +335,29 @@ func TestImagesAndRefs(t *testing.T) {
 	}
 	if ids, _ := s.ExistingImageIDs(ctx, []string{mine.ID, spare.ID}); !ids[mine.ID] || ids[spare.ID] {
 		t.Fatalf("existing %v", ids)
+	}
+}
+
+func TestListPendingQuery(t *testing.T) {
+	ctx := context.Background()
+	s, user := testStore(t)
+	for _, w := range []string{"Apple", "pineapple", "banana", "100%", "a_b", "axb", `back\slash`} {
+		if _, err := s.SaveWord(ctx, user, SavedWord{Word: w}, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for q, want := range map[string]int{"APP": 2, "ana": 1, "%": 1, "_": 1, `\`: 1, "zzz": 0, "": 7} {
+		got, err := s.ListPending(ctx, user, time.Time{}, "", q, 10)
+		if err != nil || len(got) != want {
+			t.Errorf("query %q: %d words (%v), want %d", q, len(got), err, want)
+		}
+	}
+	page1, err := s.ListPending(ctx, user, time.Time{}, "", "app", 1)
+	if err != nil || len(page1) != 1 {
+		t.Fatalf("page 1: %v %v", page1, err)
+	}
+	page2, err := s.ListPending(ctx, user, page1[0].CreatedAt, page1[0].Word, "app", 1)
+	if err != nil || len(page2) != 1 || page2[0].Word == page1[0].Word {
+		t.Fatalf("page 2: %v %v", page2, err)
 	}
 }
