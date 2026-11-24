@@ -76,6 +76,7 @@ const (
 	maxContentBytes = 64 << 10
 	maxURLBytes     = 2048
 	maxDeckRunes    = 64
+	maxQueryLen     = 100
 	maxCardImages   = 20
 	defaultDeck     = "My Words"
 )
@@ -90,7 +91,7 @@ type Looker interface {
 type Store interface {
 	SaveWord(ctx context.Context, userID string, w store.SavedWord, max int) (int, error)
 	CountPending(ctx context.Context, userID string) (total, fresh int, err error)
-	ListPending(ctx context.Context, userID string, afterCreated time.Time, afterWord string, limit int) ([]store.SavedWord, error)
+	ListPending(ctx context.Context, userID string, afterCreated time.Time, afterWord, query string, limit int) ([]store.SavedWord, error)
 	Pending(ctx context.Context, userID string, scope store.Scope) ([]store.SavedWord, error)
 	DeletePending(ctx context.Context, userID, word string) error
 	MarkExported(ctx context.Context, userID string, words []string, remove bool) (int64, error)
@@ -114,7 +115,7 @@ type Prefs interface {
 
 // Decks builds an Anki deck.
 type Decks interface {
-	Build(ctx context.Context, deckName string, words []anki.Word) ([]byte, error)
+	Build(ctx context.Context, deckName string, words []anki.Word, fresh bool) ([]byte, error)
 }
 
 // Config of the service.
@@ -314,6 +315,10 @@ func (s *Service) ListSavedWords(ctx context.Context, req *dictionaryv1.ListSave
 	if err != nil {
 		return nil, err
 	}
+	query := strings.TrimSpace(req.GetQuery())
+	if utf8.RuneCountInString(query) > maxQueryLen {
+		return nil, apperror.InvalidArgument("query is too long")
+	}
 	var (
 		afterCreated time.Time
 		afterWord    string
@@ -329,7 +334,7 @@ func (s *Service) ListSavedWords(ctx context.Context, req *dictionaryv1.ListSave
 		}
 		afterWord = parts[1]
 	}
-	rows, err := s.store.ListPending(ctx, user, afterCreated, afterWord, size+1)
+	rows, err := s.store.ListPending(ctx, user, afterCreated, afterWord, query, size+1)
 	if err != nil {
 		return nil, internal(ctx, "list saved words", err)
 	}
@@ -402,7 +407,7 @@ func (s *Service) buildDeck(ctx context.Context, user, rawName string, scope dic
 	if err := s.attachImages(ctx, user, cards); err != nil {
 		return nil, err
 	}
-	data, err := s.decks.Build(ctx, name, cards)
+	data, err := s.decks.Build(ctx, name, cards, s.userPrefs(ctx).FreshDeck)
 	switch {
 	case err == nil:
 	case errors.Is(err, anki.ErrTooLarge):

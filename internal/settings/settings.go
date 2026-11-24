@@ -152,6 +152,9 @@ type User struct {
 	// were exported earlier and are still in the list. It is cleared when the setting goes off, so the question
 	// comes again the next time it is on.
 	RemoveAcknowledged bool
+	// FreshDeck: every export is a new deck for Anki, so importing it again adds the cards again. Off (the default):
+	// the cards keep their identity and Anki updates them.
+	FreshDeck bool
 }
 
 // UserDefaults are the preferences of a user who never chose: everything on, English first.
@@ -169,6 +172,7 @@ type userJSON struct {
 
 	RemoveAfterExport  *bool `json:"removeAfterExport,omitempty"`
 	RemoveAcknowledged bool  `json:"removeAcknowledged,omitempty"`
+	FreshDeck          bool  `json:"freshDeck,omitempty"`
 }
 
 // ParseUser reads the stored object; anything missing or unreadable keeps the default.
@@ -191,6 +195,7 @@ func ParseUser(raw string) User {
 		out.RemoveAfterExport = *j.RemoveAfterExport
 	}
 	out.RemoveAcknowledged = j.RemoveAcknowledged
+	out.FreshDeck = j.FreshDeck
 	out.DeckName = j.DeckName
 	if j.MaxLookupWords >= 1 && j.MaxLookupWords <= MaxLookupLimit {
 		out.MaxLookupWords = j.MaxLookupWords
@@ -203,7 +208,7 @@ func (u User) JSON() string {
 	b, _ := json.Marshal(userJSON{
 		EnglishEnabled: &u.EnglishEnabled, EnglishViEnabled: &u.EnglishViEnabled,
 		DefaultDictionary: u.DefaultDictionary, DeckName: u.DeckName, MaxLookupWords: u.MaxLookupWords,
-		RemoveAfterExport: &u.RemoveAfterExport, RemoveAcknowledged: u.RemoveAcknowledged,
+		RemoveAfterExport: &u.RemoveAfterExport, RemoveAcknowledged: u.RemoveAcknowledged, FreshDeck: u.FreshDeck,
 	})
 	return string(b)
 }

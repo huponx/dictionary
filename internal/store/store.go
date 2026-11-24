@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/huponx/dictionary/internal/cardref"
@@ -146,23 +148,30 @@ func (s *Store) CountPending(ctx context.Context, userID string) (total, fresh i
 }
 
 // ListPending returns up to limit words of the list, newest first (created_at, then word, both descending),
-// starting after the key (afterCreated, afterWord) when afterWord is not empty.
-func (s *Store) ListPending(ctx context.Context, userID string, afterCreated time.Time, afterWord string, limit int) ([]SavedWord, error) {
-	var (
-		rows pgx.Rows
-		err  error
-	)
-	const cols = `SELECT word, content, audio_uk, audio_us, created_at, exported_at IS NOT NULL FROM dictionary_saved_words WHERE user_id = $1 AND removed_at IS NULL`
-	if afterWord == "" {
-		rows, err = s.pool.Query(ctx, cols+` ORDER BY created_at DESC, word DESC LIMIT $2`, userID, limit)
-	} else {
-		rows, err = s.pool.Query(ctx, cols+` AND (created_at, word) < ($2, $3) ORDER BY created_at DESC, word DESC LIMIT $4`,
-			userID, afterCreated, afterWord, limit)
+// starting after the key (afterCreated, afterWord) when afterWord is not empty. A non-empty query keeps only the
+// words that contain it (case-insensitive).
+func (s *Store) ListPending(ctx context.Context, userID string, afterCreated time.Time, afterWord, query string, limit int) ([]SavedWord, error) {
+	q := `SELECT word, content, audio_uk, audio_us, created_at, exported_at IS NOT NULL FROM dictionary_saved_words WHERE user_id = $1 AND removed_at IS NULL`
+	args := []any{userID}
+	if query != "" {
+		args = append(args, escapeLike(query))
+		q += ` AND word ILIKE '%' || $` + strconv.Itoa(len(args)) + ` || '%' ESCAPE '\'`
 	}
+	if afterWord != "" {
+		args = append(args, afterCreated, afterWord)
+		q += ` AND (created_at, word) < ($` + strconv.Itoa(len(args)-1) + `, $` + strconv.Itoa(len(args)) + `)`
+	}
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, q+` ORDER BY created_at DESC, word DESC LIMIT $`+strconv.Itoa(len(args)), args...)
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	return scanWords(rows)
+}
+
+// escapeLike makes s match literally in a LIKE pattern (ESCAPE '\').
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
 // Pending returns the words an export packs, oldest first (the order of the cards of a deck): the words of the

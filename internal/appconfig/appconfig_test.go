@@ -3,6 +3,7 @@ package appconfig
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/huponx/gocommon/config"
 )
@@ -31,6 +32,9 @@ func TestLoadDefaultsAndValidate(t *testing.T) {
 	}
 	if cfg.ImageDir != "" || cfg.ImageMaxBytes != 300<<10 || cfg.ImageMaxDim != 1024 || cfg.ImageMaxPixels != 25_000_000 || cfg.ImageUserQuota != 20<<20 {
 		t.Errorf("image defaults: %+v", cfg)
+	}
+	if cfg.UnusedImageAge != 24*time.Hour || cfg.OrphanSweepEvery != 24*time.Hour || cfg.OrphanFileAge != time.Hour {
+		t.Errorf("cleanup defaults: %+v", cfg)
 	}
 	if got := strings.Join(cfg.Hosts(), " "); got != "api.dictionaryapi.dev upload.wikimedia.org ssl.gstatic.com" {
 		t.Errorf("hosts = %q", got)

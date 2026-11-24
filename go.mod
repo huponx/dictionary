@@ -3,10 +3,10 @@ module github.com/huponx/dictionary
 go 1.26.10
 
 require (
-	github.com/ezynda3/go-anki-deck v0.2.0
 	github.com/google/uuid v1.6.0
-	github.com/huponx/gocommon v0.4.0
-	github.com/huponx/protogen/go v0.1.11
+	github.com/huponx/go-anki-deck v0.1.0
+	github.com/huponx/gocommon v0.4.1
+	github.com/huponx/protogen/go v0.1.12
 	github.com/jackc/pgx/v5 v5.13.0
 	go.uber.org/zap v1.28.0
 	golang.org/x/image v0.48.0

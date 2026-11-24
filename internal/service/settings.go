@@ -69,7 +69,7 @@ func toProtoUser(u settings.User) *dictionaryv1.UserSettings {
 	return &dictionaryv1.UserSettings{
 		EnglishEnabled: u.EnglishEnabled, EnglishViEnabled: u.EnglishViEnabled, DefaultDictionary: d,
 		DeckName: u.DeckName, MaxLookupWords: int32(u.MaxLookupWords),
-		RemoveAfterExport: u.RemoveAfterExport, RemoveAcknowledged: u.RemoveAcknowledged,
+		RemoveAfterExport: u.RemoveAfterExport, RemoveAcknowledged: u.RemoveAcknowledged, FreshDeck: u.FreshDeck,
 	}
 }
 
@@ -152,7 +152,7 @@ func (s *Service) UpdateMySettings(ctx context.Context, req *dictionaryv1.Update
 	u := settings.User{
 		EnglishEnabled: in.GetEnglishEnabled(), EnglishViEnabled: in.GetEnglishViEnabled(),
 		DefaultDictionary: settings.English, DeckName: in.GetDeckName(), MaxLookupWords: int(in.GetMaxLookupWords()),
-		RemoveAfterExport: in.GetRemoveAfterExport(), RemoveAcknowledged: in.GetRemoveAcknowledged(),
+		RemoveAfterExport: in.GetRemoveAfterExport(), RemoveAcknowledged: in.GetRemoveAcknowledged(), FreshDeck: in.GetFreshDeck(),
 	}
 	if in.GetDefaultDictionary() == dictionaryv1.Dictionary_DICTIONARY_ENGLISH_VIETNAMESE {
 		u.DefaultDictionary = settings.EnglishVietnamese
