@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	goanki "github.com/ezynda3/go-anki-deck"
 	"github.com/huponx/dictionary/internal/cardref"
+	goanki "github.com/huponx/go-anki-deck"
 	"github.com/huponx/gocommon/retry"
 	"go.uber.org/zap"
 )
@@ -85,13 +85,17 @@ type audio struct {
 
 // Build returns the .apkg of the words (one card each). A file that cannot be downloaded is left out
 // of its card without failing the deck.
-func (b *Builder) Build(ctx context.Context, deckName string, words []Word) ([]byte, error) {
+//
+// fresh decides what Anki does when the deck is imported again. Off: the cards keep their identity (guid of the
+// word, ids of the deck and of the note type from the deck name), so Anki updates them. On: every export is a
+// new deck, so Anki adds the cards again.
+func (b *Builder) Build(ctx context.Context, deckName string, words []Word, fresh bool) ([]byte, error) {
 	if len(words) == 0 {
 		return nil, errors.New("anki: no words")
 	}
 	files := b.download(ctx, words)
 
-	deck, err := goanki.NewDeck(deckName)
+	deck, err := goanki.NewDeckWithOptions(deckName, &goanki.Options{Fresh: fresh})
 	if err != nil {
 		return nil, fmt.Errorf("anki: new deck: %w", err)
 	}

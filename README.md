@@ -46,7 +46,7 @@ Errors a client may want to recognize start with a code in the message: `MAX_SAV
 Two kinds, both optional to set (a missing value is the default, so a new setting needs no migration):
 
 - **System settings**, edited by an administrator (admin app, page Dictionary): rows `key` / `value jsonb` of `dictionary_settings` (migration `V18`). Keys: `max_saved_words` (1 to 1000, default `DICTIONARY_MAX_SAVED_WORDS`), `allow_export_deck`, `allow_export_link`, `english_enabled`, `english_vi_enabled` (default on; at least one dictionary stays on), `remove_after_export` (default on, see "Saved words and export batches") and `exported_retention_hours` (1 to 8760, default `DICTIONARY_EXPORTED_RETENTION`). They are enforced here: `SaveWord` uses the stored maximum (words above a lowered maximum stay, only a new save is refused), `ExportAnki` / `CreateDeckLink` answer `FEATURE_DISABLED` when off, a lookup in a turned off dictionary answers `DICTIONARY_DISABLED`.
-- **Preferences of a user** (dict app, page Settings): one JSON object for the application `dictionary` in `identity_user_settings`, which identity owns. Dictionary calls `GetMyUserSettings` / `PutMyUserSettings` of identity on behalf of the user: it exchanges the token of the request for one with the audience `DICTIONARY_IDENTITY_AUDIENCE` (RFC 8693, `gocommon/tokenexchange`) and calls `DICTIONARY_IDENTITY_ADDR`. The preferences narrow what the system allows; the web app applies them (enabled and default dictionary, deck name, words per lookup), the server only validates them. The exception is `removeAfterExport`, which the server reads at export time (effective value = system AND user; identity down means the default, remove). `removeAcknowledged` is only kept for the dict app. If identity is down `GetMySettings` answers with the defaults.
+- **Preferences of a user** (dict app, page Settings): one JSON object for the application `dictionary` in `identity_user_settings`, which identity owns. Dictionary calls `GetMyUserSettings` / `PutMyUserSettings` of identity on behalf of the user: it exchanges the token of the request for one with the audience `DICTIONARY_IDENTITY_AUDIENCE` (RFC 8693, `gocommon/tokenexchange`) and calls `DICTIONARY_IDENTITY_ADDR`. The preferences narrow what the system allows; the web app applies them (enabled and default dictionary, deck name, words per lookup), the server only validates them. The exceptions are `removeAfterExport` and `freshDeck`, which the server reads at export time (effective value = system AND user; identity down means the default, remove). `removeAcknowledged` is only kept for the dict app. If identity is down `GetMySettings` answers with the defaults.
 
 ## Lookup sources
 
@@ -74,6 +74,7 @@ Cambridge answers 403 behind Cloudflare, so nothing is scraped from it. The entr
 - `ExportAnki` / `CreateDeckLink` read the new words (`scope` NEW, the default) or the whole list (`scope` ALL), oldest first, one card each: the word on the front, the saved HTML on the back. They build the deck and then set `exported_at = now()` on exactly those rows, and `removed_at = now()` too when remove after export is in effect. A deck that fails or is too large changes nothing. Words saved while the deck was built are not touched. With nothing new and `scope` NEW the answer is `NO_WORDS_TO_EXPORT`.
 - **Remove after export** is the system setting `remove_after_export` AND the preference `removeAfterExport` of the user (both default on). Off: exported words stay in the list, flagged `exported`, and the user chooses "export all" or "export new only" the next time. When it comes on again (an administrator or the user), the dict app asks once whether to remove the exported words that are still in the list (`RemoveExportedWords`) or keep them.
 - Rows that left the list are kept for the system setting `exported_retention_hours` (default `DICTIONARY_EXPORTED_RETENTION`, `168h`, 7 days; 1 to 8760 hours) and then deleted by a cleanup that runs inside the service every `DICTIONARY_CLEANUP_INTERVAL` (default `1h`), in batches of 500 rows with `FOR UPDATE SKIP LOCKED`, so several replicas can run it. It reads the setting on every run and never deletes a word that is in the list. There is no API to export an old batch again; the retention only covers a response that got lost.
+- **Importing again updates, it does not duplicate.** The Anki library is the fork `huponx/go-anki-deck`: the guid of a card is the hash of its word (trimmed, lower case) and the ids of the deck and of the note type come from the deck name. Anki therefore treats a word exported twice as the same note and updates its front and back (the review history stays). Keep the same deck name between exports (the user's `deckName` preference). A user who wants every export to be a separate deck turns on the preference `freshDeck` (dict app, Settings, "New deck on every export"; `UserSettings.fresh_deck`): then the ids come from the clock and the guid also depends on the back, as in the upstream library (`anki.Options{Fresh: true}`). It is read at export time, like `removeAfterExport`, and is off by default. Decks exported before this change carry other guids: the first import after it adds one more copy of each word, and the old copies can be deleted once.
 - The card back may contain the placeholders `replace_audio_uk` and `replace_audio_us`: in the deck they become sound tags of the downloaded files (or nothing when a file could not be downloaded).
 
 Audio files are downloaded by the service when it builds a deck, so the URLs a client saves are restricted: `https` and a host of `DICTIONARY_AUDIO_HOSTS` (default `api.dictionaryapi.dev`, `upload.wikimedia.org`, `ssl.gstatic.com`), checked at save time, again at download time and on every redirect. Files are at most 512 KiB, the downloads of one deck share a 20 second budget, and a file that fails is left out without failing the export.
@@ -86,10 +87,10 @@ The deck travels in the gRPC response (and as base64 in the JSON of gatekeeper),
 
 ## Local development
 
-`go.mod` pins released versions of `gocommon` and `protogen`. To work against the sibling checkouts instead, use a Go workspace (`go.work` is git-ignored and not sent to Docker builds):
+`go.mod` pins released versions of `gocommon`, `protogen` and `go-anki-deck`. To work against the sibling checkouts instead, use a Go workspace (`go.work` is git-ignored and not sent to Docker builds):
 
 ```bash
-go work init . ../gocommon ../protogen/go   # once, in dictionary/; delete go.work to go back to the pinned versions
+go work init . ../gocommon ../protogen/go ../go-anki-deck   # once, in dictionary/; delete go.work to go back to the pinned versions
 ```
 
 ```bash
@@ -141,6 +142,9 @@ All settings are environment variables (see `.env.example`).
 | `DICTIONARY_IMAGE_MAX_DIM` | `1024` | Longest side in pixels; larger images are scaled down |
 | `DICTIONARY_IMAGE_MAX_PIXELS` | `25000000` | Uploads with more pixels are refused before they are decoded |
 | `DICTIONARY_IMAGE_USER_QUOTA` | `20971520` | Bytes of images one user may keep |
+| `DICTIONARY_UNUSED_IMAGE_AGE` | `24h` | An image no card refers to is deleted after this long (min `1h`: an upload comes before the save of its card). |
+| `DICTIONARY_ORPHAN_SWEEP_EVERY` | `24h` | How often the image volume is compared with the table to delete files without a row (min `1m`). |
+| `DICTIONARY_ORPHAN_FILE_AGE` | `1h` | Files younger than this are never swept, so an upload in progress is safe (min `10m`). |
 | `DICTIONARY_LOOKUP_CACHE_TTL` / `SIZE` | `24h` / `2000` | In-memory cache of entries; `0` turns it off |
 | `DICTIONARY_HTTP_TIMEOUT` | `10s` | One call to a provider or an audio file |
 | `DICTIONARY_USER_AGENT` | `huponx-dictionary/1.0 (+https://github.com/huponx/dictionary)` | Sent to the providers |

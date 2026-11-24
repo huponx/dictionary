@@ -185,10 +185,10 @@ func cleanup(ctx context.Context, st *store.Store, files *imagestore.Store, cfg 
 				log.Info("exported words deleted", zap.Int64("count", total))
 			}
 			if files != nil {
-				cleanImages(ctx, st, files, log)
-				if time.Since(lastSweep) >= orphanSweepEvery {
+				cleanImages(ctx, st, files, cfg.UnusedImageAge, log)
+				if time.Since(lastSweep) >= cfg.OrphanSweepEvery {
 					lastSweep = time.Now()
-					sweepOrphanFiles(ctx, st, files, log)
+					sweepOrphanFiles(ctx, st, files, cfg.OrphanFileAge, log)
 				}
 			}
 			if n, err := st.DeleteExpiredDeckLinks(ctx, time.Now()); err != nil {
@@ -200,21 +200,11 @@ func cleanup(ctx context.Context, st *store.Store, files *imagestore.Store, cfg 
 	}
 }
 
-const (
-	// unusedImageAge: an image no card refers to is deleted after this long (an upload comes before the save
-	// of the card that uses it).
-	unusedImageAge = 24 * time.Hour
-	// orphanSweepEvery: how often the volume is compared with the table (files without a row, left by a deleted
-	// user or a failed delete); orphanFileAge protects the files of an upload in progress.
-	orphanSweepEvery = 24 * time.Hour
-	orphanFileAge    = time.Hour
-)
-
 // cleanImages deletes the images no word uses (their rows first, then their files), in batches.
-func cleanImages(ctx context.Context, st *store.Store, files *imagestore.Store, log *zap.Logger) {
+func cleanImages(ctx context.Context, st *store.Store, files *imagestore.Store, unusedAge time.Duration, log *zap.Logger) {
 	var total int
 	for {
-		rows, err := st.DeleteUnusedImages(ctx, time.Now().Add(-unusedImageAge), cleanupBatch)
+		rows, err := st.DeleteUnusedImages(ctx, time.Now().Add(-unusedAge), cleanupBatch)
 		if err != nil {
 			log.Warn("cleanup images", zap.Error(err))
 			break
@@ -236,7 +226,7 @@ func cleanImages(ctx context.Context, st *store.Store, files *imagestore.Store, 
 }
 
 // sweepOrphanFiles deletes the files of the volume that have no row.
-func sweepOrphanFiles(ctx context.Context, st *store.Store, files *imagestore.Store, log *zap.Logger) {
+func sweepOrphanFiles(ctx context.Context, st *store.Store, files *imagestore.Store, minAge time.Duration, log *zap.Logger) {
 	users, err := files.Users()
 	if err != nil {
 		log.Warn("sweep image files", zap.Error(err))
@@ -247,7 +237,7 @@ func sweepOrphanFiles(ctx context.Context, st *store.Store, files *imagestore.St
 		if ctx.Err() != nil {
 			return
 		}
-		n, err := files.Orphans(u, orphanFileAge, cleanupBatch, func(fs []imagestore.File) (map[string]bool, error) {
+		n, err := files.Orphans(u, minAge, cleanupBatch, func(fs []imagestore.File) (map[string]bool, error) {
 			ids := make([]string, len(fs))
 			for i, f := range fs {
 				ids[i] = f.ID

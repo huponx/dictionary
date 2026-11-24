@@ -4,12 +4,16 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestAllowedURL(t *testing.T) {
@@ -75,7 +79,7 @@ func TestBuild(t *testing.T) {
 		{Word: "world", Content: "w " + PlaceholderUS, AudioUS: srv.URL + "/missing.mp3"},    // fails: placeholder dropped
 		{Word: "evil", Content: "e " + PlaceholderUK, AudioUK: "https://evil.example/x.mp3"}, // not allowed: never fetched
 	}
-	data, err := b.Build(context.Background(), "My Words", words)
+	data, err := b.Build(context.Background(), "My Words", words, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +106,7 @@ func TestBuildImages(t *testing.T) {
 	data, err := bd.Build(context.Background(), "d", []Word{
 		{Word: "one", Content: `<p>x</p><img src="dictimg:` + a + `"><img src="dictimg:` + b + `">`, Images: imgs}, // b has no file
 		{Word: "two", Content: `<img src="dictimg:` + c + `">`, Images: imgs},
-	})
+	}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,10 +122,10 @@ func TestBuildImages(t *testing.T) {
 
 func TestBuildTooLarge(t *testing.T) {
 	b := &Builder{Client: http.DefaultClient, MaxBytes: 10}
-	if _, err := b.Build(context.Background(), "d", []Word{{Word: "a", Content: "b"}}); !errors.Is(err, ErrTooLarge) {
+	if _, err := b.Build(context.Background(), "d", []Word{{Word: "a", Content: "b"}}, false); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("err = %v, want ErrTooLarge", err)
 	}
-	if _, err := b.Build(context.Background(), "d", nil); err == nil {
+	if _, err := b.Build(context.Background(), "d", nil, false); err == nil {
 		t.Error("no words must fail")
 	}
 }
@@ -153,4 +157,75 @@ func keys(m map[string][]byte) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// noteGUIDs reads the guid of each note (by its front) from the collection inside the .apkg.
+func noteGUIDs(t *testing.T, apkg []byte) map[string]string {
+	t.Helper()
+	db := filepath.Join(t.TempDir(), "collection.anki2")
+	data, ok := files(t, apkg)["collection.anki2"]
+	if !ok {
+		t.Fatal("no collection in the deck")
+	}
+	if err := os.WriteFile(db, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := sql.Open("sqlite3", db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	rows, err := conn.Query("SELECT sfld, guid FROM notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var front, guid string
+		if err := rows.Scan(&front, &guid); err != nil {
+			t.Fatal(err)
+		}
+		out[front] = guid
+	}
+	return out
+}
+
+// Importing an exported deck again must update its cards in Anki, not add copies: the guid of a card depends on
+// its word only, so a word whose card was edited keeps it.
+func TestBuildKeepsGUIDsAcrossExports(t *testing.T) {
+	b := &Builder{Client: http.DefaultClient}
+	first, err := b.Build(context.Background(), "My Words", []Word{{Word: "hello", Content: "<div>old</div>"}, {Word: "world", Content: "x"}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := b.Build(context.Background(), "My Words", []Word{{Word: "Hello", Content: "<div>edited</div>"}, {Word: "world", Content: "x"}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g1, g2 := noteGUIDs(t, first), noteGUIDs(t, second)
+	if g1["hello"] == "" || g1["hello"] != g2["Hello"] {
+		t.Errorf("guid of hello changed: %q -> %q", g1["hello"], g2["Hello"])
+	}
+	if g1["world"] != g2["world"] || g1["hello"] == g1["world"] {
+		t.Errorf("guids of world: %q -> %q (hello %q)", g1["world"], g2["world"], g1["hello"])
+	}
+}
+
+// A user who wants every export to be a new deck gets other guids each time, so Anki adds the cards again.
+func TestBuildFreshHasNewGUIDs(t *testing.T) {
+	b := &Builder{Client: http.DefaultClient}
+	words := []Word{{Word: "hello", Content: "<div>text</div>"}}
+	first, err := b.Build(context.Background(), "My Words", words, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond) // the ids of a fresh deck come from the millisecond clock
+	second, err := b.Build(context.Background(), "My Words", words, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g1, g2 := noteGUIDs(t, first), noteGUIDs(t, second); g1["hello"] == "" || g1["hello"] == g2["hello"] {
+		t.Errorf("fresh decks share the guid: %q %q", g1["hello"], g2["hello"])
+	}
 }
