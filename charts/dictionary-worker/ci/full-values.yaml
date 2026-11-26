@@ -1,0 +1,23 @@
+application:
+  deployment:
+    replicas: 2
+    # No PVC in the chart test cluster: an emptyDir stands in for the claim dictionary-files.
+    volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 512Mi
+      - name: files
+        emptyDir:
+          sizeLimit: 128Mi
+    container:
+      image:
+        tag: "v2026.08.1-release-e1f4018"
+  secrets:
+    - name: POSTGRES_PASSWORD
+      secretName: data-user-rw
+      key: password
+  config:
+    data:
+      POSTGRES_HOST: postgres.infrastructure.svc.cluster.local
+      POSTGRES_USER: app_rw
+      POSTGRES_DB: app

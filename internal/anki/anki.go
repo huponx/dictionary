@@ -36,6 +36,9 @@ type Word struct {
 	// Images are the files of the images Content refers to as <img src="dictimg:<id>">; a reference without a
 	// file loses its tag.
 	Images map[string]Image
+	// AudioFiles are the files of the uploaded audio: AudioUK / AudioUS hold dictaud:<id> and the key is that
+	// whole value. A reference without a file leaves its sound out.
+	AudioFiles map[string]Image
 }
 
 // Image is a file of a card.
@@ -48,7 +51,7 @@ type Image struct {
 type Builder struct {
 	Client       *http.Client
 	AllowedHosts []string
-	// MaxBytes is the largest deck returned (0: no limit).
+	// MaxBytes is the largest deck returned (0: no limit) unless the context of Build says otherwise (WithMaxBytes).
 	MaxBytes int
 	// MaxAudioBytes is the largest audio file attached (default 512 KiB); a larger one is skipped.
 	MaxAudioBytes int64
@@ -83,6 +86,43 @@ type audio struct {
 	data []byte
 }
 
+type progressKey struct{}
+
+type maxBytesKey struct{}
+
+// WithMaxBytes returns a context whose Build limits the deck to n bytes instead of Builder.MaxBytes (0: no limit),
+// so the limit can follow a setting that changes while the service runs.
+func WithMaxBytes(ctx context.Context, n int) context.Context {
+	return context.WithValue(ctx, maxBytesKey{}, n)
+}
+
+func (b *Builder) maxBytes(ctx context.Context) int {
+	if n, ok := ctx.Value(maxBytesKey{}).(int); ok {
+		return n
+	}
+	return b.MaxBytes
+}
+
+// WithProgress returns a context whose Build reports its progress to fn: a fraction from 0 to 1 that grows while the
+// audio is downloaded and the cards are added (the last part, saving the deck, is not reported: it is the end of Build).
+// fn is called from several goroutines and must not block for long.
+func WithProgress(ctx context.Context, fn func(fraction float64)) context.Context {
+	return context.WithValue(ctx, progressKey{}, fn)
+}
+
+// ReportProgress tells the function of WithProgress (when the context has one) how far a build is.
+func ReportProgress(ctx context.Context, fraction float64) {
+	if fn, ok := ctx.Value(progressKey{}).(func(float64)); ok {
+		fn(fraction)
+	}
+}
+
+// the share of Build that each phase takes in the progress: downloading the audio, then adding the cards
+const (
+	downloadShare = 0.7
+	cardsShare    = 0.25
+)
+
 // Build returns the .apkg of the words (one card each). A file that cannot be downloaded is left out
 // of its card without failing the deck.
 //
@@ -94,6 +134,7 @@ func (b *Builder) Build(ctx context.Context, deckName string, words []Word, fres
 		return nil, errors.New("anki: no words")
 	}
 	files := b.download(ctx, words)
+	ReportProgress(ctx, downloadShare)
 
 	deck, err := goanki.NewDeckWithOptions(deckName, &goanki.Options{Fresh: fresh})
 	if err != nil {
@@ -103,8 +144,15 @@ func (b *Builder) Build(ctx context.Context, deckName string, words []Word, fres
 
 	for i, w := range words {
 		back := w.Content
-		back = strings.ReplaceAll(back, PlaceholderUS, soundTag(deck, fmt.Sprintf("w%03d_us.mp3", i), files[w.AudioUS]))
-		back = strings.ReplaceAll(back, PlaceholderUK, soundTag(deck, fmt.Sprintf("w%03d_uk.mp3", i), files[w.AudioUK]))
+		for _, side := range []struct{ placeholder, name, ref string }{
+			{PlaceholderUS, "us", w.AudioUS}, {PlaceholderUK, "uk", w.AudioUK},
+		} {
+			a, ext := files[side.ref], "mp3"
+			if up, ok := w.AudioFiles[side.ref]; ok && cardref.IsAudioRef(side.ref) {
+				a, ext = &audio{data: up.Data}, up.Ext
+			}
+			back = strings.ReplaceAll(back, side.placeholder, soundTag(deck, fmt.Sprintf("w%03d_%s.%s", i, side.name, ext), a))
+		}
 		back = cardref.ReplaceTags(back, func(id string) string {
 			img, ok := w.Images[id]
 			if !ok || len(img.Data) == 0 {
@@ -116,12 +164,16 @@ func (b *Builder) Build(ctx context.Context, deckName string, words []Word, fres
 		if err := deck.AddCard(w.Word, back); err != nil {
 			return nil, fmt.Errorf("anki: card %q: %w", w.Word, err)
 		}
+		if (i+1)%50 == 0 {
+			ReportProgress(ctx, downloadShare+cardsShare*float64(i+1)/float64(len(words)))
+		}
 	}
+	ReportProgress(ctx, downloadShare+cardsShare)
 	data, err := deck.Save()
 	if err != nil {
 		return nil, fmt.Errorf("anki: save deck: %w", err)
 	}
-	if b.MaxBytes > 0 && len(data) > b.MaxBytes {
+	if limit := b.maxBytes(ctx); limit > 0 && len(data) > limit {
 		return nil, ErrTooLarge
 	}
 	return data, nil
@@ -135,7 +187,7 @@ func soundTag(deck *goanki.Deck, name string, a *audio) string {
 	return deck.AddAudio(name, a.data)
 }
 
-// download fetches every distinct audio URL of the words, a few at a time, within the budget.
+// download fetches every distinct audio URL (the uploaded files are in Word.AudioFiles, not downloaded) of the words, a few at a time, within the budget.
 func (b *Builder) download(ctx context.Context, words []Word) map[string]*audio {
 	budget := b.AudioBudget
 	if budget <= 0 {
@@ -148,7 +200,7 @@ func (b *Builder) download(ctx context.Context, words []Word) map[string]*audio 
 	seen := map[string]bool{}
 	for _, w := range words {
 		for _, u := range []string{w.AudioUS, w.AudioUK} {
-			if u != "" && !seen[u] {
+			if u != "" && !seen[u] && !cardref.IsAudioRef(u) {
 				seen[u] = true
 				urls = append(urls, u)
 			}
@@ -156,9 +208,10 @@ func (b *Builder) download(ctx context.Context, words []Word) map[string]*audio 
 	}
 	out := make(map[string]*audio, len(urls))
 	var (
-		mu  sync.Mutex
-		wg  sync.WaitGroup
-		sem = make(chan struct{}, downloadWorkers)
+		mu   sync.Mutex
+		done int
+		wg   sync.WaitGroup
+		sem  = make(chan struct{}, downloadWorkers)
 	)
 	for _, u := range urls {
 		wg.Add(1)
@@ -167,6 +220,13 @@ func (b *Builder) download(ctx context.Context, words []Word) map[string]*audio 
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			data, err := b.fetch(ctx, u)
+			defer func() { // a file that failed counts too: the progress is the files tried
+				mu.Lock()
+				done++
+				share := downloadShare * float64(done) / float64(len(urls))
+				mu.Unlock()
+				ReportProgress(ctx, share)
+			}()
 			if err != nil {
 				if b.Log != nil {
 					b.Log.Warn("audio skipped", zap.String("url", u), zap.Error(err))

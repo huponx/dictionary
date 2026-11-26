@@ -1,4 +1,4 @@
-package imagestore
+package filestore
 
 import (
 	"bytes"
@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-var opts = Options{MaxBytes: 300 << 10, MaxDim: 1024, MaxPixels: 25_000_000}
+var opts = ImageOptions{MaxBytes: 300 << 10, MaxDim: 1024, MaxPixels: 25_000_000}
 
 func noisy(w, h int, alpha uint8) *image.NRGBA {
 	img := image.NewNRGBA(image.Rect(0, 0, w, h))
@@ -42,7 +42,7 @@ func dims(t *testing.T, b []byte) (int, int, string) {
 }
 
 func TestNormalizeShrinksAndEncodesJPEG(t *testing.T) {
-	res, err := Normalize(encPNG(t, noisy(2000, 1000, 255)), opts)
+	res, err := NormalizeImage(encPNG(t, noisy(2000, 1000, 255)), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestNormalizeShrinksAndEncodesJPEG(t *testing.T) {
 func TestNormalizeKeepsAlphaAsPNG(t *testing.T) {
 	img := image.NewNRGBA(image.Rect(0, 0, 40, 40))
 	img.SetNRGBA(1, 1, color.NRGBA{255, 0, 0, 128})
-	res, err := Normalize(encPNG(t, img), opts)
+	res, err := NormalizeImage(encPNG(t, img), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestNormalizeGIFFirstFrame(t *testing.T) {
 	if err := gif.EncodeAll(&b, &gif.GIF{Image: []*image.Paletted{f1, f2}, Delay: []int{1, 1}}); err != nil {
 		t.Fatal(err)
 	}
-	res, err := Normalize(b.Bytes(), opts)
+	res, err := NormalizeImage(b.Bytes(), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestNormalizeOrientationAndMetadata(t *testing.T) {
 	if !bytes.Contains(in, []byte("GPSLatitude-secret")) {
 		t.Fatal("test input has no metadata")
 	}
-	res, err := Normalize(in, opts)
+	res, err := NormalizeImage(in, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,31 +152,31 @@ func TestNormalizeOrientationAndMetadata(t *testing.T) {
 }
 
 func TestNormalizeRejects(t *testing.T) {
-	if _, err := Normalize([]byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`), opts); err != ErrFormat {
+	if _, err := NormalizeImage([]byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`), opts); err != ErrImageFormat {
 		t.Fatalf("svg: %v", err)
 	}
-	if _, err := Normalize([]byte("hello"), opts); err != ErrFormat {
+	if _, err := NormalizeImage([]byte("hello"), opts); err != ErrImageFormat {
 		t.Fatalf("text: %v", err)
 	}
-	if _, err := Normalize([]byte("\x89PNG\r\n\x1a\ntruncated"), opts); err != ErrFormat {
+	if _, err := NormalizeImage([]byte("\x89PNG\r\n\x1a\ntruncated"), opts); err != ErrImageFormat {
 		t.Fatalf("truncated: %v", err)
 	}
 	// 4000x4000 is within a bigger limit but over this one; it is refused from the header alone
-	small := Options{MaxBytes: opts.MaxBytes, MaxDim: 1024, MaxPixels: 1_000_000}
-	if _, err := Normalize(encPNG(t, image.NewNRGBA(image.Rect(0, 0, 4000, 4000))), small); err != ErrPixels {
+	small := ImageOptions{MaxBytes: opts.MaxBytes, MaxDim: 1024, MaxPixels: 1_000_000}
+	if _, err := NormalizeImage(encPNG(t, image.NewNRGBA(image.Rect(0, 0, 4000, 4000))), small); err != ErrPixels {
 		t.Fatalf("pixels: %v", err)
 	}
 }
 
 func TestNormalizeTooLarge(t *testing.T) {
 	// noise does not compress: even a tiny limit cannot be met by shrinking down to the minimum
-	if _, err := Normalize(encPNG(t, noisy(600, 600, 255)), Options{MaxBytes: 200, MaxDim: 1024, MaxPixels: 25_000_000}); err != ErrTooLarge {
+	if _, err := NormalizeImage(encPNG(t, noisy(600, 600, 255)), ImageOptions{MaxBytes: 200, MaxDim: 1024, MaxPixels: 25_000_000}); err != ErrImageTooLarge {
 		t.Fatalf("got %v", err)
 	}
 }
 
 func TestNormalizeShrinksStepsToFit(t *testing.T) {
-	res, err := Normalize(encPNG(t, noisy(1024, 1024, 255)), Options{MaxBytes: 60 << 10, MaxDim: 1024, MaxPixels: 25_000_000})
+	res, err := NormalizeImage(encPNG(t, noisy(1024, 1024, 255)), ImageOptions{MaxBytes: 60 << 10, MaxDim: 1024, MaxPixels: 25_000_000})
 	if err != nil {
 		t.Fatal(err)
 	}
