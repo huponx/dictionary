@@ -5,7 +5,7 @@ IMAGE_REPO ?= ghcr.io/huponx
 # database of `make up` in db-migration; the store tests need it migrated (V15, V20 and V21)
 TEST_DB ?= postgres://postgres:postgres@localhost:5432/app?sslmode=disable
 
-.PHONY: help tidy upgrade outdated test test-store test-live vet build run docker clean
+.PHONY: help tidy upgrade outdated test test-store test-live vet build run run-worker docker docker-worker clean
 
 help:
 	@printf '%s\n' \
@@ -13,12 +13,14 @@ help:
 		'upgrade  upgrade the dependencies (PATCH=1: patch releases only), tidy, build and test' \
 		'outdated  list the dependencies that have a newer version' \
 		'test    go test -race ./... (the store tests are skipped without a database)' \
-		'test-store  the store tests against $$TEST_DB (db-migration migrated to V21 or later)' \
+		'test-store  the store tests against $$TEST_DB (db-migration migrated to V25 or later)' \
 		'test-live   call the real dictionary APIs once (DICTIONARY_LIVE=1), to check the parsers' \
 		'vet     go vet ./...' \
-		'build   dictionary into $(BIN)/' \
+		'build   dictionary and dictionary-worker into $(BIN)/' \
 		'run     go run ./cmd/dictionary (reads the environment, see .env.example)' \
-		'docker  build the image'
+		'run-worker  go run ./cmd/dictionary-worker (export jobs and cleanup; same environment)' \
+		'docker  build the image of the API' \
+		'docker-worker  build the image of the worker'
 
 tidy:
 	GOWORK=off $(GO) mod tidy
@@ -55,12 +57,19 @@ vet:
 build:
 	@mkdir -p $(BIN)
 	$(GO) build -o $(BIN)/dictionary ./cmd/dictionary
+	$(GO) build -o $(BIN)/dictionary-worker ./cmd/dictionary-worker
 
 run:
 	$(GO) run ./cmd/dictionary
 
+run-worker:
+	$(GO) run ./cmd/dictionary-worker
+
 docker:
 	docker build -f build/dictionary/Dockerfile -t $(IMAGE_REPO)/dictionary:$(IMAGE_TAG) .
+
+docker-worker:
+	docker build -f build/dictionary-worker/Dockerfile -t $(IMAGE_REPO)/dictionary-worker:$(IMAGE_TAG) .
 
 clean:
 	rm -rf $(BIN)

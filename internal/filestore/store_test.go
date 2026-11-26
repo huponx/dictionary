@@ -1,4 +1,4 @@
-package imagestore
+package filestore
 
 import (
 	"bytes"
@@ -76,5 +76,45 @@ func TestOrphans(t *testing.T) {
 	users, _ := s.Users()
 	if len(users) != 1 || users[0] != user {
 		t.Fatalf("users %v", users)
+	}
+}
+
+func TestRemoveAll(t *testing.T) {
+	dir := t.TempDir()
+	s := &Store{Dir: filepath.Join(dir, "images")}
+	user, other := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	img := "33333333-3333-3333-3333-333333333333"
+	for _, u := range []string{user, other} {
+		if err := s.Write(u, img, "png", []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.RemoveAll(user); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(s.Dir, user)); !os.IsNotExist(err) {
+		t.Errorf("the directory of the user is still there: %v", err)
+	}
+	if _, err := s.Read(other, img, "png"); err != nil {
+		t.Errorf("another user lost a file: %v", err)
+	}
+	if err := s.RemoveAll(user); err != nil { // a missing directory is fine
+		t.Errorf("second RemoveAll: %v", err)
+	}
+	// only a user id: nothing can leave Dir
+	keep := filepath.Join(dir, "keep.txt")
+	if err := os.WriteFile(keep, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"", ".", "..", "../", "../keep.txt", "../images", other + "/..", "/", dir, "*"} {
+		if err := s.RemoveAll(bad); err == nil {
+			t.Errorf("RemoveAll(%q) did not fail", bad)
+		}
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("a file outside Dir was touched: %v", err)
+	}
+	if _, err := s.Read(other, img, "png"); err != nil {
+		t.Errorf("another user lost a file after the bad names: %v", err)
 	}
 }

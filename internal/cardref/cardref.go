@@ -47,3 +47,37 @@ func ReplaceTags(content string, fn func(id string) string) string {
 		return out
 	})
 }
+
+// AudioPrefix is the scheme of the audio references: audio_uk and audio_us hold dictaud:<id> for an uploaded
+// file (the id is the one UploadAudio returned), or an https URL.
+const AudioPrefix = "dictaud:"
+
+var audioRe = regexp.MustCompile(`^` + AudioPrefix + `(` + uuidPattern + `)$`)
+
+// AudioID returns the id of an audio reference; ok is false for anything else (an URL, an empty string).
+func AudioID(value string) (id string, ok bool) {
+	m := audioRe.FindStringSubmatch(value)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// AudioIDs returns the distinct ids among the audio values (the URLs are skipped), in order.
+func AudioIDs(values ...string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, v := range values {
+		if id, ok := AudioID(v); ok && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// IsAudioRef reports whether the value is an audio reference (dictaud:<id>).
+func IsAudioRef(value string) bool {
+	_, ok := AudioID(value)
+	return ok
+}

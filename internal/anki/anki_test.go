@@ -10,7 +10,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -117,6 +119,28 @@ func TestBuildImages(t *testing.T) {
 	}
 	if bytes.Contains(f["collection.anki2"], []byte("dictimg:")) {
 		t.Error("a dictimg: reference is left in the deck")
+	}
+}
+
+func TestBuildUploadedAudio(t *testing.T) {
+	const a, b = "dictaud:11111111-1111-4111-8111-111111111111", "dictaud:22222222-2222-4222-8222-222222222222"
+	var hits atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))
+	defer srv.Close()
+	bd := &Builder{Client: srv.Client(), AllowedHosts: []string{"127.0.0.1", "dictaud"}}
+	files4 := map[string]Image{a: {Data: []byte("OggS-bytes"), Ext: "ogg"}}
+	data, err := bd.Build(context.Background(), "d", []Word{
+		{Word: "one", Content: "x " + PlaceholderUK + " " + PlaceholderUS, AudioUK: a, AudioUS: b, AudioFiles: files4}, // b has no file
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := string(files(t, data)["media"])
+	if !strings.Contains(media, "w000_uk.ogg") || strings.Contains(media, "w000_us") || strings.Contains(media, ".mp3") {
+		t.Errorf("media = %s", media)
+	}
+	if hits.Load() != 0 {
+		t.Errorf("an uploaded file was fetched %d times", hits.Load())
 	}
 }
 
@@ -227,5 +251,43 @@ func TestBuildFreshHasNewGUIDs(t *testing.T) {
 	}
 	if g1, g2 := noteGUIDs(t, first), noteGUIDs(t, second); g1["hello"] == "" || g1["hello"] == g2["hello"] {
 		t.Errorf("fresh decks share the guid: %q %q", g1["hello"], g2["hello"])
+	}
+}
+
+func TestBuildReportsProgress(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("mp3")) }))
+	defer srv.Close()
+	host := strings.TrimPrefix(srv.URL, "https://")
+	host = host[:strings.LastIndex(host, ":")]
+	bd := &Builder{Client: srv.Client(), AllowedHosts: []string{host}}
+	var words []Word
+	for i := range 120 { // more than one report of the cards, and 3 files to download
+		w := Word{Word: "w" + strings.Repeat("a", i%7) + string(rune('a'+i/7%26)) + string(rune('a'+i/182)), Content: "c"}
+		if i < 3 {
+			w.AudioUS = srv.URL + "/" + string(rune('a'+i)) + ".mp3"
+		}
+		words = append(words, w)
+	}
+	var mu sync.Mutex
+	var got []float64
+	ctx := WithProgress(context.Background(), func(f float64) {
+		mu.Lock()
+		got = append(got, f)
+		mu.Unlock()
+	})
+	if _, err := bd.Build(ctx, "d", words, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) < 5 {
+		t.Fatalf("too few reports: %v", got)
+	}
+	sorted := append([]float64{}, got...)
+	sort.Float64s(sorted)
+	if sorted[0] <= 0 || sorted[len(sorted)-1] >= 1 || sorted[len(sorted)-1] < downloadShare+cardsShare-0.001 {
+		t.Errorf("fractions: %v", sorted)
+	}
+	// without a function in the context Build reports to nobody
+	if _, err := bd.Build(context.Background(), "d", words[:3], false); err != nil {
+		t.Fatal(err)
 	}
 }

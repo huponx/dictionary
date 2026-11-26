@@ -1,12 +1,12 @@
 application:
   deployment:
     replicas: 2
-    # No PVC in the chart test cluster: an emptyDir stands in for the claim dictionary-images.
+    # No PVC in the chart test cluster: an emptyDir stands in for the claim dictionary-files.
     volumes:
       - name: tmp
         emptyDir:
           sizeLimit: 128Mi
-      - name: images
+      - name: files
         emptyDir:
           sizeLimit: 128Mi
     container:

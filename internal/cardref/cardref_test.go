@@ -38,3 +38,15 @@ func TestReplaceTagsKeepsWidth(t *testing.T) {
 		t.Fatalf("got %q", out)
 	}
 }
+
+func TestAudioIDs(t *testing.T) {
+	got := AudioIDs("dictaud:"+a, "https://x.example/a.mp3", "", "dictaud:"+b, "dictaud:"+a)
+	if !reflect.DeepEqual(got, []string{a, b}) {
+		t.Fatalf("got %v", got)
+	}
+	for _, bad := range []string{"dictaud:", "dictaud:nope", " dictaud:" + a, "dictaud:" + a + "x", "DICTAUD:" + a} {
+		if _, ok := AudioID(bad); ok {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
