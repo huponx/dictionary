@@ -1,4 +1,4 @@
-package imagestore
+package filestore
 
 import (
 	"crypto/sha256"
@@ -12,30 +12,38 @@ import (
 )
 
 // ErrNotFound: there is no such file.
-var ErrNotFound = errors.New("imagestore: not found")
+var ErrNotFound = errors.New("filestore: not found")
 
 var (
 	idRe   = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-	fileRe = regexp.MustCompile(`^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(jpg|png)$`)
+	fileRe = regexp.MustCompile(`^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(jpg|png|mp3|ogg|wav|m4a|apkg)$`)
 )
 
-// Store keeps the files of the images under Dir.
+// Store keeps the files of the uploads (images or audio) under Dir.
 type Store struct {
 	Dir string
 }
 
-// Ext is the file extension of a content type of Normalize.
+var exts = map[string]string{
+	"image/jpeg": "jpg", "image/png": "png",
+	"audio/mpeg": "mp3", "audio/ogg": "ogg", "audio/wav": "wav", "audio/mp4": "m4a",
+	"application/vnd.anki": "apkg", // the deck files of the export jobs
+}
+
+// Ext is the file extension of a content type of NormalizeImage or SniffAudio ("jpg" for an unknown one).
 func Ext(contentType string) string {
-	if contentType == "image/png" {
-		return "png"
+	if e, ok := exts[contentType]; ok {
+		return e
 	}
 	return "jpg"
 }
 
-// ContentType is the content type of a file extension.
+// ContentType is the content type of a file extension ("image/jpeg" for an unknown one).
 func ContentType(ext string) string {
-	if ext == "png" {
-		return "image/png"
+	for ct, e := range exts {
+		if e == ext {
+			return ct
+		}
 	}
 	return "image/jpeg"
 }
@@ -46,11 +54,20 @@ func Hash(data []byte) []byte {
 	return h[:]
 }
 
-// path is the file of an image; ids come from the database or from uuid.New, but they are checked again
+func validExt(ext string) bool {
+	for _, e := range exts {
+		if e == ext {
+			return true
+		}
+	}
+	return false
+}
+
+// path is the file of an upload; ids come from the database or from uuid.New, but they are checked again
 // because they become a path.
 func (s *Store) path(user, id, ext string) (string, error) {
-	if !idRe.MatchString(user) || !idRe.MatchString(id) || (ext != "jpg" && ext != "png") {
-		return "", fmt.Errorf("imagestore: bad name %q/%q.%q", user, id, ext)
+	if !idRe.MatchString(user) || !idRe.MatchString(id) || !validExt(ext) {
+		return "", fmt.Errorf("filestore: bad name %q/%q.%q", user, id, ext)
 	}
 	return filepath.Join(s.Dir, user, id+"."+ext), nil
 }
@@ -100,6 +117,27 @@ func (s *Store) Read(user, id, ext string) ([]byte, error) {
 	return b, err
 }
 
+// Open returns the file and its size, ErrNotFound when the file is missing. The caller closes it.
+func (s *Store) Open(user, id, ext string) (*os.File, int64, error) {
+	p, err := s.path(user, id, ext)
+	if err != nil {
+		return nil, 0, err
+	}
+	f, err := os.Open(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, 0, ErrNotFound
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, err
+	}
+	return f, info.Size(), nil
+}
+
 // Remove deletes the file of an image; a missing file is not an error.
 func (s *Store) Remove(user, id, ext string) error {
 	p, err := s.path(user, id, ext)
@@ -112,6 +150,15 @@ func (s *Store) Remove(user, id, ext string) error {
 	return nil
 }
 
+// RemoveAll deletes the directory of a user with every file in it (the account was deleted); a missing directory is
+// not an error. The user must be a UUID, so the path cannot leave Dir.
+func (s *Store) RemoveAll(user string) error {
+	if !idRe.MatchString(user) {
+		return fmt.Errorf("filestore: bad user %q", user)
+	}
+	return os.RemoveAll(filepath.Join(s.Dir, user))
+}
+
 // File is an image file found on the volume.
 type File struct {
 	User, ID, Ext string
@@ -122,7 +169,7 @@ type File struct {
 // error. Temporary files older than minAge are deleted too.
 func (s *Store) Orphans(user string, minAge time.Duration, batch int, keep func([]File) (map[string]bool, error)) (removed int, err error) {
 	if !idRe.MatchString(user) {
-		return 0, fmt.Errorf("imagestore: bad user %q", user)
+		return 0, fmt.Errorf("filestore: bad user %q", user)
 	}
 	entries, err := os.ReadDir(filepath.Join(s.Dir, user))
 	if errors.Is(err, fs.ErrNotExist) {

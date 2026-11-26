@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 	"unicode"
@@ -16,9 +17,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/huponx/dictionary/internal/anki"
 	"github.com/huponx/dictionary/internal/cardref"
-	"github.com/huponx/dictionary/internal/imagestore"
+	"github.com/huponx/dictionary/internal/filestore"
 	"github.com/huponx/dictionary/internal/lookup"
 	"github.com/huponx/dictionary/internal/settings"
+	"github.com/huponx/dictionary/internal/srs"
 	"github.com/huponx/dictionary/internal/store"
 	"github.com/huponx/gocommon/apperror"
 	"github.com/huponx/gocommon/authn"
@@ -33,30 +35,62 @@ import (
 // Permissions required per method. grpcserver.WithMethodPermissions is deny by default, so a new RPC
 // has no entry here until somebody decides who may call it.
 var Permissions = map[string]string{
-	"/dictionary.v1.DictionaryService/LookupWord":          "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/LookupWords":         "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/ListSavedWords":      "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/SaveWord":            "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/DeleteSavedWord":     "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/ExportAnki":          "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/CreateDeckLink":      "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/RemoveExportedWords": "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/UploadImage":         "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/GetImage":            "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/GetSettings":         "dictionary:settings:read",
-	"/dictionary.v1.DictionaryService/UpdateSettings":      "dictionary:settings:write",
-	"/dictionary.v1.DictionaryService/GetMySettings":       "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/UpdateMySettings":    "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/LookupWord":           "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/LookupWords":          "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/ListSavedWords":       "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/SaveWord":             "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/DeleteSavedWord":      "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/ExportAnki":           "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/CreateDeckLink":       "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/RemoveExportedWords":  "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/CheckSavedWords":      "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/StartExport":          "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/GetExport":            "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/CancelExport":         "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/CreateExportPartLink": "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/ListCategories":       "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/CreateCategory":       "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/RenameCategory":       "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/DeleteCategory":       "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/UpdateWordCategories": "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/UploadImage":          "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/GetImage":             "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/UploadAudio":          "dictionary:word:write",
+	"/dictionary.v1.DictionaryService/GetAudio":             "dictionary:word:read",
+	// the review changes no word of the list, only the schedule of the user: reading is enough, like UpdateMySettings
+	"/dictionary.v1.DictionaryService/GetReviewQueue":           "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/SubmitReview":             "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/AddReviewBonus":           "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/OptimizeReviewParameters": "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/GetSettings":              "dictionary:settings:read",
+	"/dictionary.v1.DictionaryService/UpdateSettings":           "dictionary:settings:write",
+	"/dictionary.v1.DictionaryService/GetUserQuota":             "dictionary:settings:read",
+	"/dictionary.v1.DictionaryService/SetUserQuota":             "dictionary:settings:write",
+	"/dictionary.v1.DictionaryService/GetMyStorage":             "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/GetMySettings":            "dictionary:word:read",
+	"/dictionary.v1.DictionaryService/UpdateMySettings":         "dictionary:word:read",
 	// the gateway calls it for the anonymous download request with its service token: any authenticated
 	// caller passes the permission check, the method itself accepts only a service token
-	"/dictionary.v1.DictionaryService/DownloadDeck": grpcserver.Public,
+	"/dictionary.v1.DictionaryService/DownloadDeck":       grpcserver.Public,
+	"/dictionary.v1.DictionaryService/DownloadExportPart": grpcserver.Public,
 }
 
 // Messages of the errors a client may want to recognize start with these codes.
 const (
 	CodeMaxSavedWords = "MAX_SAVED_WORDS_REACHED"
+	// CodeMaxSavedBytes: the content of the list of the user would pass the quota of the user.
+	CodeMaxSavedBytes = "SAVED_BYTES_EXCEEDED"
 	CodeNoWords       = "NO_WORDS_TO_EXPORT"
 	CodeExportTooBig  = "EXPORT_TOO_LARGE"
+	// CodeExportUseJob: the list is too long for a synchronous export (ExportSyncMax words).
+	CodeExportUseJob = "EXPORT_USE_JOB"
+	// CodeExportJobActive: the user already has an export job queued or running. CodeExportJobsDisabled: no export
+	// directory is configured.
+	CodeExportJobActive    = "EXPORT_JOB_ACTIVE"
+	CodeExportJobsDisabled = "EXPORT_JOBS_DISABLED"
+	// Categories: the user has the maximum number of them; the name is in use.
+	CodeCategoryLimit  = "CATEGORY_LIMIT_REACHED"
+	CodeCategoryExists = "CATEGORY_EXISTS"
 	// CodeFeatureDisabled: an administrator turned the export off. CodeDictionaryDisabled: same for a dictionary.
 	CodeFeatureDisabled    = "FEATURE_DISABLED"
 	CodeDictionaryDisabled = "DICTIONARY_DISABLED"
@@ -68,17 +102,25 @@ const (
 	CodeImageTooLarge  = "IMAGE_TOO_LARGE"
 	CodeImageQuota     = "IMAGE_QUOTA_EXCEEDED"
 	CodeImageUnknown   = "IMAGE_NOT_FOUND"
+	// Audio files, the same five cases (AUDIO_UNSUPPORTED: not an mp3, ogg, wav or m4a file).
+	CodeAudioDisabled = "AUDIO_DISABLED"
+	CodeAudioInvalid  = "AUDIO_UNSUPPORTED"
+	CodeAudioTooLarge = "AUDIO_TOO_LARGE"
+	CodeAudioQuota    = "AUDIO_QUOTA_EXCEEDED"
+	CodeAudioUnknown  = "AUDIO_NOT_FOUND"
 )
+
+// UncategorizedID as a category_id stands for uncategorized = true (for the GET requests, whose query string has no bool).
+const UncategorizedID = "uncategorized"
 
 // Limits of the requests.
 const (
-	maxLookupWords  = 20
-	maxContentBytes = 64 << 10
-	maxURLBytes     = 2048
-	maxDeckRunes    = 64
-	maxQueryLen     = 100
-	maxCardImages   = 20
-	defaultDeck     = "My Words"
+	maxLookupWords = 20
+	maxURLBytes    = 2048
+	maxDeckRunes   = 64
+	maxQueryLen    = 100
+	maxCardImages  = 20
+	defaultDeck    = "My Words"
 )
 
 // Looker finds the entries of words.
@@ -89,22 +131,61 @@ type Looker interface {
 
 // Store keeps the saved words (the store package).
 type Store interface {
-	SaveWord(ctx context.Context, userID string, w store.SavedWord, max int) (int, error)
-	CountPending(ctx context.Context, userID string) (total, fresh int, err error)
-	ListPending(ctx context.Context, userID string, afterCreated time.Time, afterWord, query string, limit int) ([]store.SavedWord, error)
-	Pending(ctx context.Context, userID string, scope store.Scope) ([]store.SavedWord, error)
+	SaveWord(ctx context.Context, userID string, w store.SavedWord, max int, contentQuota int64, categoryIDs []string) (int, error)
+	CountPending(ctx context.Context, userID string, f store.WordFilter) (total, fresh int, capped bool, err error)
+	ListPending(ctx context.Context, userID string, afterCreated time.Time, afterWord, query string, f store.WordFilter, limit int) ([]store.SavedWord, error)
+	Pending(ctx context.Context, userID string, scope store.Scope, f store.WordFilter, words []string, limit int) ([]store.SavedWord, error)
+	ListCategories(ctx context.Context, userID string) (store.Categories, error)
+	CategoryName(ctx context.Context, userID, id string) (string, error)
+	CreateCategory(ctx context.Context, userID, name string, max int) (store.Category, error)
+	RenameCategory(ctx context.Context, userID, id, name string) (store.Category, error)
+	DeleteCategory(ctx context.Context, userID, id string) error
+	SetWordCategories(ctx context.Context, userID string, words, add, remove []string) (int, error)
 	DeletePending(ctx context.Context, userID, word string) error
+	SavedByNames(ctx context.Context, userID string, words []string) (map[string][]string, error)
+	PendingPage(ctx context.Context, userID string, scope store.Scope, f store.WordFilter, afterCreated time.Time, afterWord string, limit int) ([]store.SavedWord, error)
+	CountExportable(ctx context.Context, userID string, scope store.Scope, f store.WordFilter) (int, error)
+	CreateExportJob(ctx context.Context, userID string, p store.ExportParams, ttl time.Duration) (store.ExportJob, error)
+	GetExportJob(ctx context.Context, userID, id string) (store.ExportJob, []store.ExportPart, error)
+	CancelExportJob(ctx context.Context, userID, id string, ttl time.Duration) (store.ExportJob, error)
+	ClaimExportJob(ctx context.Context, leaseFor time.Duration) (*store.ExportJob, error)
+	RenewExportLease(ctx context.Context, id, leaseID string, leaseFor time.Duration) error
+	SetExportTotal(ctx context.Context, id, leaseID string, total int) error
+	SetExportBuilding(ctx context.Context, id, leaseID string, n int) error
+	AddExportPart(ctx context.Context, job store.ExportJob, leaseID string, p store.ExportPart, words []string, after store.SavedWord) error
+	FinishExportJob(ctx context.Context, id, leaseID, status, errMsg string, ttl time.Duration) error
+	SetExportPartToken(ctx context.Context, userID, id string, n int, hash []byte) (store.ExportPart, time.Time, error)
+	ExportPartByToken(ctx context.Context, hash []byte, now time.Time) (userID string, p store.ExportPart, err error)
+	DeleteExpiredExportJobs(ctx context.Context, now time.Time, limit int) (int, []store.ExpiredFile, error)
+	ExistingExportFileIDs(ctx context.Context, ids []string) (map[string]bool, error)
 	MarkExported(ctx context.Context, userID string, words []string, remove bool) (int64, error)
 	RemoveExported(ctx context.Context, userID string) (int64, error)
 	PutDeckLink(ctx context.Context, userID string, tokenHash []byte, l store.DeckLink) error
 	TakeDeckLink(ctx context.Context, tokenHash []byte, now time.Time) (*store.DeckLink, error)
 	Settings(ctx context.Context) (map[string]json.RawMessage, error)
 	PutSettings(ctx context.Context, rows map[string]json.RawMessage) error
-	ImageBytes(ctx context.Context, userID string) (int64, error)
+	GetStorageUsage(ctx context.Context, userID string) (store.StorageUsage, error)
+	SetStorageQuota(ctx context.Context, userID string, q store.Quotas) error
 	ImageBySHA(ctx context.Context, userID string, sha []byte) (*store.Image, error)
 	GetImage(ctx context.Context, userID, id string) (*store.Image, error)
 	ImagesByIDs(ctx context.Context, userID string, ids []string) ([]store.Image, error)
 	InsertImage(ctx context.Context, im store.Image) (existing *store.Image, inserted bool, err error)
+	AudioBySHA(ctx context.Context, userID string, sha []byte) (*store.Audio, error)
+	GetAudio(ctx context.Context, userID, id string) (*store.Audio, error)
+	AudioByIDs(ctx context.Context, userID string, ids []string) ([]store.Audio, error)
+	InsertAudio(ctx context.Context, a store.Audio) (existing *store.Audio, inserted bool, err error)
+	ReviewQueue(ctx context.Context, userID string, now time.Time, f store.WordFilter, limit, dueAllowed, newAllowed int) ([]store.ReviewCard, error)
+	ReviewCounts(ctx context.Context, userID string, now time.Time, f store.WordFilter) (store.ReviewCounts, error)
+	ReviewToday(ctx context.Context, userID string, now time.Time) (newWords, again int, err error)
+	ReviewBonus(ctx context.Context, userID string, now time.Time) (store.ReviewBonus, error)
+	AddReviewBonus(ctx context.Context, userID string, now time.Time, newWords, reviews int) (store.ReviewBonus, error)
+	PutReview(ctx context.Context, userID, word string, now time.Time, grade srs.Grade, next func(srs.State) srs.State) (srs.State, error)
+	FSRSParams(ctx context.Context, userID string) (*store.FSRSParams, error)
+	PutFSRSParams(ctx context.Context, userID string, p store.FSRSParams) error
+	DeleteFSRSParams(ctx context.Context, userID string) error
+	ClaimOptimize(ctx context.Context, userID string, now time.Time, gap time.Duration) (bool, error)
+	LockOptimize(ctx context.Context, userID string) (unlock func(), ok bool, err error)
+	ReviewLogs(ctx context.Context, userID string, limit int) ([][]srs.Review, error)
 }
 
 // Prefs keeps the preferences of the user of the request (identity, see the identityclient package).
@@ -126,6 +207,21 @@ type Config struct {
 	AudioHosts             []string
 	// DeckLinkTTL is how long a download link works, default 15 minutes.
 	DeckLinkTTL time.Duration
+	// ExportSyncMax is the default of the system setting "export sync max words": the most words a synchronous export
+	// packs (2000 when 0); more is EXPORT_USE_JOB.
+	ExportSyncMax int
+	// ExportJobTTL is how long the parts of a finished export job can be downloaded, default 24 hours.
+	ExportJobTTL time.Duration
+	// ExportMaxBytes and ExportPartMaxBytes are the defaults of the system settings "export size" and "export part
+	// size", and the ceilings are the most an administrator can set (0: the defaults of the settings package).
+	ExportMaxBytes, ExportPartMaxBytes               int
+	ExportMaxBytesCeiling, ExportPartMaxBytesCeiling int
+	// Storage holds the defaults of the system settings of the size of the content and of the quotas, and their
+	// ceilings (zero: the defaults of the settings package). The defaults of the quotas of the images and of the audio
+	// files are the ones of WithImages and WithAudio unless set here.
+	Storage settings.StorageLimits
+	// ExportJobBatchMax is the most words an export job reads and packs at once (default 20000).
+	ExportJobBatchMax int
 }
 
 // Service is the gRPC implementation.
@@ -137,15 +233,37 @@ type Service struct {
 	decks  Decks
 	cfg    Config
 	prefs  Prefs
+	// now is the clock; tests set it
+	now func() time.Time
 
-	files    *imagestore.Store
-	imgOpts  imagestore.Options
+	files    *filestore.Store
+	imgOpts  filestore.ImageOptions
 	imgQuota int64
+
+	audio      *filestore.Store
+	audioMax   int
+	audioQuota int64
+
+	// sched keeps the schedule settings of a user for a short time (nil: no cache); optimizing limits the runs of
+	// the optimizer of this instance.
+	sched *scheduleCache
+	// exports keeps the deck files of the export jobs (nil: no jobs)
+	exports *filestore.Store
+	// cats keeps the category counts of a user for a short time (nil: no cache)
+	cats       *categoryCache
+	optimizing chan struct{}
+}
+
+// WithAudio turns the audio files of the cards on: the files go to files, a file is at most maxBytes and a user
+// may keep quota bytes. Without it UploadAudio and GetAudio fail with AUDIO_DISABLED.
+func (s *Service) WithAudio(files *filestore.Store, maxBytes int, quota int64) *Service {
+	s.audio, s.audioMax, s.audioQuota = files, maxBytes, quota
+	return s
 }
 
 // WithImages turns the images of the cards on: the files go to files, every image is normalized with opts and a
 // user may keep quota bytes. Without it UploadImage fails with IMAGES_DISABLED.
-func (s *Service) WithImages(files *imagestore.Store, opts imagestore.Options, quota int64) *Service {
+func (s *Service) WithImages(files *filestore.Store, opts filestore.ImageOptions, quota int64) *Service {
 	s.files, s.imgOpts, s.imgQuota = files, opts, quota
 	return s
 }
@@ -159,10 +277,13 @@ func (s *Service) WithPrefs(p Prefs) *Service {
 
 // New builds the service.
 func New(looker Looker, st Store, decks Decks, cfg Config) *Service {
+	if cfg.ExportJobTTL <= 0 {
+		cfg.ExportJobTTL = 24 * time.Hour
+	}
 	if cfg.DeckLinkTTL <= 0 {
 		cfg.DeckLinkTTL = 15 * time.Minute
 	}
-	return &Service{looker: looker, store: st, decks: decks, cfg: cfg}
+	return &Service{looker: looker, store: st, decks: decks, cfg: cfg, now: time.Now, optimizing: make(chan struct{}, maxOptimizing)}
 }
 
 // userID is the user of the request: the subject of the token, never a field of the request. A service
@@ -170,13 +291,13 @@ func New(looker Looker, st Store, decks Decks, cfg Config) *Service {
 func userID(ctx context.Context) (string, error) {
 	p := authn.FromContext(ctx)
 	if p == nil || p.Subject == "" {
-		return "", apperror.Unauthenticated("a user token is required")
+		return "", apperror.Unauthenticated("a user token is required").WithReason("user_token_required")
 	}
 	if p.IsService() {
-		return "", apperror.PermissionDenied("a user token is required, not a service token")
+		return "", apperror.PermissionDenied("a user token is required, not a service token").WithReason("service_token_not_allowed")
 	}
 	if _, err := uuid.Parse(p.Subject); err != nil {
-		return "", apperror.Unauthenticated("a user token is required")
+		return "", apperror.Unauthenticated("a user token is required").WithReason("user_token_required")
 	}
 	return p.Subject, nil
 }
@@ -188,19 +309,19 @@ func dictionaryOf(d dictionaryv1.Dictionary) (lookup.Dictionary, error) {
 	case dictionaryv1.Dictionary_DICTIONARY_ENGLISH_VIETNAMESE:
 		return lookup.EnglishVietnamese, nil
 	}
-	return "", apperror.InvalidArgument("unknown dictionary")
+	return "", apperror.InvalidArgument("unknown dictionary").WithReason("unknown_dictionary")
 }
 
 // lookupErr maps the errors of a lookup. Details of a provider failure are logged, not sent.
 func lookupErr(ctx context.Context, err error) error {
 	switch {
 	case errors.Is(err, lookup.ErrInvalidWord):
-		return apperror.InvalidArgument("not a valid word: letters, digits, spaces, apostrophes, hyphens and dots, at most 64 characters")
+		return apperror.InvalidArgument("not a valid word: letters, digits, spaces, apostrophes, hyphens and dots, at most 64 characters").WithReason("invalid_word")
 	case errors.Is(err, lookup.ErrNotFound):
-		return apperror.NotFound("word not found")
+		return apperror.NotFound("word not found").WithReason("word_not_found")
 	case errors.Is(err, lookup.ErrUnavailable):
 		logging.FromCtx(ctx).Warn("dictionary provider failed", zap.Error(err))
-		return apperror.Unavailable("the dictionary is not available, try again later")
+		return apperror.Unavailable("the dictionary is not available, try again later").WithReason("dictionary_unavailable")
 	}
 	logging.FromCtx(ctx).Error("lookup", zap.Error(err))
 	return apperror.Internal("internal error")
@@ -247,7 +368,7 @@ func (s *Service) LookupWords(ctx context.Context, req *dictionaryv1.LookupWords
 		return nil, err
 	}
 	if n := len(req.GetWords()); n == 0 || n > maxLookupWords {
-		return nil, apperror.InvalidArgument("send between 1 and 20 words")
+		return nil, apperror.InvalidArgument("send between 1 and 20 words").WithReason("word_batch_range", "max", "20")
 	}
 	if err := s.requireDictionary(ctx, d); err != nil {
 		return nil, err
@@ -269,36 +390,43 @@ func (s *Service) SaveWord(ctx context.Context, req *dictionaryv1.SaveWordReques
 	if err != nil {
 		return nil, err
 	}
+	defer s.cats.forget(user)
 	word, err := lookup.NormalizeWord(req.GetWord())
 	if err != nil {
 		return nil, lookupErr(ctx, err)
-	}
-	if len(req.GetContent()) > maxContentBytes {
-		return nil, apperror.InvalidArgument("content is larger than 64 KiB")
-	}
-	for _, u := range []string{req.GetAudioUk(), req.GetAudioUs()} {
-		if u != "" && (len(u) > maxURLBytes || !anki.AllowedURL(u, s.cfg.AudioHosts)) {
-			return nil, apperror.InvalidArgument("audio must be an https URL on an allowed host")
-		}
-	}
-	if ids := cardref.IDs(req.GetContent()); len(ids) > maxCardImages {
-		return nil, apperror.InvalidArgument("a card can have at most 20 images")
 	}
 	sys, err := s.system(ctx)
 	if err != nil {
 		return nil, err
 	}
+	if len(req.GetContent()) > sys.MaxContentBytes {
+		return nil, apperror.InvalidArgument(fmt.Sprintf("content is larger than %s", byteSize(sys.MaxContentBytes))).WithReason("content_too_large", "limit", byteSize(sys.MaxContentBytes))
+	}
+	for _, u := range []string{req.GetAudioUk(), req.GetAudioUs()} {
+		if _, uploaded := cardref.AudioID(u); u != "" && !uploaded && (len(u) > maxURLBytes || !anki.AllowedURL(u, s.cfg.AudioHosts)) {
+			return nil, apperror.InvalidArgument("audio must be an uploaded file or an https URL on an allowed host").WithReason("audio_source_invalid")
+		}
+	}
+	if ids := cardref.IDs(req.GetContent()); len(ids) > maxCardImages {
+		return nil, apperror.InvalidArgument("a card can have at most 20 images").WithReason("too_many_images", "max", "20")
+	}
 	n, err := s.store.SaveWord(ctx, user, store.SavedWord{
 		Word: word, Content: req.GetContent(), AudioUK: req.GetAudioUk(), AudioUS: req.GetAudioUs(),
-	}, sys.MaxSavedWords)
+	}, sys.MaxSavedWords, sys.ContentUserQuota, req.GetCategoryIds())
 	switch {
 	case err == nil:
+	case errors.Is(err, store.ErrNotFound):
+		return nil, apperror.NotFound("category not found").WithReason("category_not_found")
 	case errors.Is(err, store.ErrLimit):
-		return nil, apperror.Wrap(codes.ResourceExhausted, CodeMaxSavedWords+": maximum number of saved words reached, export or delete some first", nil)
+		return nil, apperror.Wrap(codes.ResourceExhausted, CodeMaxSavedWords+": maximum number of saved words reached, export or delete some first", nil).WithReason("max_saved_words_reached")
+	case errors.Is(err, store.ErrBytesLimit):
+		return nil, apperror.Wrap(codes.ResourceExhausted, CodeMaxSavedBytes+": the storage of the saved words is full, export or delete some first", nil).WithReason("saved_bytes_exceeded")
 	case errors.Is(err, store.ErrUnknownImage):
-		return nil, apperror.InvalidArgument(CodeImageUnknown + ": the card refers to an image that does not exist")
+		return nil, apperror.InvalidArgument(CodeImageUnknown + ": the card refers to an image that does not exist").WithReason("image_not_found")
+	case errors.Is(err, store.ErrUnknownAudio):
+		return nil, apperror.InvalidArgument(CodeAudioUnknown + ": the card refers to an audio file that does not exist").WithReason("audio_not_found")
 	case errors.Is(err, store.ErrUnknownUser):
-		return nil, apperror.Unauthenticated("unknown user")
+		return nil, apperror.Unauthenticated("unknown user").WithReason("unknown_user")
 	default:
 		return nil, internal(ctx, "save word", err)
 	}
@@ -317,7 +445,7 @@ func (s *Service) ListSavedWords(ctx context.Context, req *dictionaryv1.ListSave
 	}
 	query := strings.TrimSpace(req.GetQuery())
 	if utf8.RuneCountInString(query) > maxQueryLen {
-		return nil, apperror.InvalidArgument("query is too long")
+		return nil, apperror.InvalidArgument("query is too long").WithReason("query_too_long")
 	}
 	var (
 		afterCreated time.Time
@@ -330,29 +458,70 @@ func (s *Service) ListSavedWords(ctx context.Context, req *dictionaryv1.ListSave
 		}
 		afterCreated, err = time.Parse(time.RFC3339Nano, parts[0])
 		if err != nil || parts[1] == "" {
-			return nil, apperror.InvalidArgument("invalid page token")
+			return nil, apperror.InvalidArgument("invalid page token").WithReason("invalid_page_token")
 		}
 		afterWord = parts[1]
 	}
-	rows, err := s.store.ListPending(ctx, user, afterCreated, afterWord, query, size+1)
+	filter := wordFilter(req.GetCategoryId(), req.GetUncategorized())
+	rows, err := s.store.ListPending(ctx, user, afterCreated, afterWord, query, filter, size+1)
 	if err != nil {
 		return nil, internal(ctx, "list saved words", err)
 	}
-	total, fresh, err := s.store.CountPending(ctx, user)
+	total, fresh, capped, err := s.store.CountPending(ctx, user, filter)
 	if err != nil {
 		return nil, internal(ctx, "count saved words", err)
 	}
-	resp := &dictionaryv1.ListSavedWordsResponse{Total: int32(total), NewTotal: int32(fresh)}
+	resp := &dictionaryv1.ListSavedWordsResponse{Total: int32(total), NewTotal: int32(fresh), CountsCapped: capped}
 	if len(rows) > size {
 		rows = rows[:size]
 		last := rows[size-1]
 		resp.NextPageToken = pagination.Encode(last.CreatedAt.UTC().Format(time.RFC3339Nano), last.Word)
 	}
 	for _, r := range rows {
+		next := ""
+		if !r.NextReview.IsZero() {
+			next = r.NextReview.UTC().Format(time.RFC3339)
+		}
 		resp.Words = append(resp.Words, &dictionaryv1.SavedWord{
 			Word: r.Word, Content: r.Content, AudioUk: r.AudioUK, AudioUs: r.AudioUS,
-			CreatedAt: r.CreatedAt.UTC().Format(time.RFC3339), Exported: r.Exported,
+			CreatedAt: r.CreatedAt.UTC().Format(time.RFC3339), Exported: r.Exported, CategoryIds: r.CategoryIDs,
+			NextReviewAt: next, Learning: r.Learning,
 		})
+	}
+	return resp, nil
+}
+
+// maxCheckWords is the most words CheckSavedWords takes (a lookup has at most 20, plus the word of the new card).
+const maxCheckWords = 100
+
+// CheckSavedWords tells which of the words are in the list of the user, with their categories.
+func (s *Service) CheckSavedWords(ctx context.Context, req *dictionaryv1.CheckSavedWordsRequest) (*dictionaryv1.CheckSavedWordsResponse, error) {
+	user, err := userID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(req.GetWords()) > maxCheckWords {
+		return nil, apperror.InvalidArgument(fmt.Sprintf("send at most %d words", maxCheckWords)).WithReason("word_batch_max", "max", fmt.Sprint(maxCheckWords))
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, w := range req.GetWords() {
+		n, err := lookup.NormalizeWord(w)
+		if err != nil || seen[n] { // a word that cannot be saved is not saved
+			continue
+		}
+		seen[n] = true
+		names = append(names, n)
+	}
+	found, err := s.store.SavedByNames(ctx, user, names)
+	if err != nil {
+		return nil, internal(ctx, "check saved words", err)
+	}
+	resp := &dictionaryv1.CheckSavedWordsResponse{}
+	for _, n := range names { // the order of the request
+		if ids, ok := found[n]; ok {
+			resp.Words = append(resp.Words, &dictionaryv1.SavedWordRef{Word: n, CategoryIds: ids})
+		}
 	}
 	return resp, nil
 }
@@ -363,6 +532,7 @@ func (s *Service) DeleteSavedWord(ctx context.Context, req *dictionaryv1.DeleteS
 	if err != nil {
 		return nil, err
 	}
+	defer s.cats.forget(user)
 	word, err := lookup.NormalizeWord(req.GetWord())
 	if err != nil {
 		return nil, lookupErr(ctx, err)
@@ -371,10 +541,33 @@ func (s *Service) DeleteSavedWord(ctx context.Context, req *dictionaryv1.DeleteS
 	case err == nil:
 		return &dictionaryv1.DeleteSavedWordResponse{}, nil
 	case errors.Is(err, store.ErrNotFound):
-		return nil, apperror.NotFound("saved word not found")
+		return nil, apperror.NotFound("saved word not found").WithReason("saved_word_not_found")
 	default:
 		return nil, internal(ctx, "delete saved word", err)
 	}
+}
+
+// maxBatchWords is the most words one request names (the selected words of an export, the words of
+// UpdateWordCategories), whatever the limit of the list is.
+const maxBatchWords = 5000
+
+// useJob is the error of a list too long for a synchronous export; it tells how many words the export has (a
+// bounded count, see CountPending).
+func (s *Service) useJob(ctx context.Context, user string, src exportSource, f store.WordFilter, syncMax int) error {
+	total, fresh, capped, err := s.store.CountPending(ctx, user, f)
+	if err != nil {
+		return internal(ctx, "count words to export", err)
+	}
+	n := fresh
+	if src.scope == dictionaryv1.ExportScope_EXPORT_SCOPE_ALL {
+		n = total
+	}
+	more := ""
+	if capped && n >= store.CountCap(f) {
+		more = "+"
+	}
+	return apperror.FailedPrecondition(fmt.Sprintf("%s: %d%s words are too many for one deck (at most %d), export in parts",
+		CodeExportUseJob, n, more, syncMax)).WithReason("export_use_job", "count", fmt.Sprint(n)+more, "max", fmt.Sprint(syncMax))
 }
 
 // builtDeck is a deck made of the words of a user.
@@ -384,41 +577,115 @@ type builtDeck struct {
 	words []string
 }
 
-// buildDeck packs the new words of the user (or the whole list, see scope) in a deck. A deck that could not
-// be built or is too large is an error and leaves the words as they were.
-func (s *Service) buildDeck(ctx context.Context, user, rawName string, scope dictionaryv1.ExportScope) (*builtDeck, error) {
+// exportSource tells which words an export packs (the fields of ExportAnkiRequest and CreateDeckLinkRequest).
+type exportSource struct {
+	scope         dictionaryv1.ExportScope
+	categoryID    string
+	uncategorized bool
+	words         []string
+}
+
+// buildDeck packs the new words of the user (or the whole list, see scope; only the words of a category, or
+// exactly the words asked for) in a deck. A deck that could not be built or is too large is an error and leaves
+// the words as they were. The name of a deck without one is the name of its category.
+func (s *Service) buildDeck(ctx context.Context, user, rawName string, src exportSource) (*builtDeck, error) {
 	name, err := deckName(rawName)
 	if err != nil {
 		return nil, err
 	}
-	words, err := s.store.Pending(ctx, user, storeScope(scope))
+	var (
+		filter store.WordFilter
+		only   []string
+	)
+	switch {
+	case len(src.words) > 0:
+		seen := map[string]bool{}
+		only = []string{}
+		for _, w := range src.words {
+			if n, err := lookup.NormalizeWord(w); err == nil && !seen[n] {
+				seen[n] = true
+				only = append(only, n)
+			}
+		}
+		if len(only) > maxBatchWords {
+			return nil, apperror.InvalidArgument("too many words to export").WithReason("export_too_many_words")
+		}
+	default:
+		filter = wordFilter(src.categoryID, src.uncategorized)
+		if filter.CategoryID != "" {
+			catName, err := s.store.CategoryName(ctx, user, filter.CategoryID)
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, apperror.NotFound("category not found").WithReason("category_not_found")
+			}
+			if err != nil {
+				return nil, internal(ctx, "read category", err)
+			}
+			if strings.TrimSpace(rawName) == "" {
+				name = catName
+			}
+		}
+	}
+	sys, err := s.system(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// read one word more than the limit to know the list is too long, without reading all of it
+	limit := sys.ExportSyncMaxWords + 1
+	if only != nil {
+		limit = 0 // at most maxBatchWords, checked above
+	}
+	words, err := s.store.Pending(ctx, user, storeScope(src.scope), filter, only, limit)
 	if err != nil {
 		return nil, internal(ctx, "read pending words", err)
 	}
-	if len(words) == 0 {
-		return nil, apperror.InvalidArgument(CodeNoWords + ": no saved words to export")
+	if only == nil && len(words) > sys.ExportSyncMaxWords {
+		return nil, s.useJob(ctx, user, src, filter, sys.ExportSyncMaxWords)
 	}
-	cards := make([]anki.Word, len(words))
+	if len(words) == 0 {
+		return nil, apperror.InvalidArgument(CodeNoWords + ": no saved words to export").WithReason("no_words_to_export")
+	}
 	keys := make([]string, len(words))
 	for i, w := range words {
-		cards[i] = anki.Word{Word: w.Word, Content: w.Content, AudioUK: w.AudioUK, AudioUS: w.AudioUS}
 		keys[i] = w.Word
+	}
+	data, err := s.packDeck(ctx, user, name, words, s.userPrefs(ctx).FreshDeck, sys.ExportMaxBytes)
+	if errors.Is(err, errDeckTooLarge) {
+		return nil, apperror.FailedPrecondition(CodeExportTooBig + ": the deck is too large, delete some words and export again").WithReason("export_too_large")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &builtDeck{name: name, data: data, words: keys}, nil
+}
+
+// packDeck builds the deck of the words: the images and the audio files of the cards are attached, then the deck
+// is built. A deck larger than maxBytes is anki.ErrTooLarge (wrapped in an error for the caller of a request).
+func (s *Service) packDeck(ctx context.Context, user, name string, words []store.SavedWord, fresh bool, maxBytes int) ([]byte, error) {
+	cards := make([]anki.Word, len(words))
+	for i, w := range words {
+		cards[i] = anki.Word{Word: w.Word, Content: w.Content, AudioUK: w.AudioUK, AudioUS: w.AudioUS}
 	}
 	if err := s.attachImages(ctx, user, cards); err != nil {
 		return nil, err
 	}
-	data, err := s.decks.Build(ctx, name, cards, s.userPrefs(ctx).FreshDeck)
+	if err := s.attachAudio(ctx, user, cards); err != nil {
+		return nil, err
+	}
+	data, err := s.decks.Build(anki.WithMaxBytes(ctx, maxBytes), name, cards, fresh)
 	switch {
 	case err == nil:
+		return data, nil
 	case errors.Is(err, anki.ErrTooLarge):
-		return nil, apperror.FailedPrecondition(CodeExportTooBig + ": the deck is too large, delete some words and export again")
+		return nil, fmt.Errorf("%w: %w", errDeckTooLarge, err)
 	case ctx.Err() != nil:
 		return nil, ctx.Err()
 	default:
 		return nil, internal(ctx, "build deck", err)
 	}
-	return &builtDeck{name: name, data: data, words: keys}, nil
 }
+
+// errDeckTooLarge marks the error of packDeck for a deck over the size limit.
+var errDeckTooLarge = errors.New("deck too large")
 
 // storeScope: only ALL packs the exported words again; new is the default.
 func storeScope(s dictionaryv1.ExportScope) store.Scope {
@@ -441,11 +708,12 @@ func (s *Service) ExportAnki(ctx context.Context, req *dictionaryv1.ExportAnkiRe
 	if err != nil {
 		return nil, err
 	}
+	defer s.cats.forget(user)
 	sys, err := s.requireExport(ctx, false)
 	if err != nil {
 		return nil, err
 	}
-	d, err := s.buildDeck(ctx, user, req.GetDeckName(), req.GetScope())
+	d, err := s.buildDeck(ctx, user, req.GetDeckName(), exportSource{req.GetScope(), req.GetCategoryId(), req.GetUncategorized(), req.GetWords()})
 	if err != nil {
 		return nil, err
 	}
@@ -461,6 +729,7 @@ func (s *Service) RemoveExportedWords(ctx context.Context, _ *dictionaryv1.Remov
 	if err != nil {
 		return nil, err
 	}
+	defer s.cats.forget(user)
 	n, err := s.store.RemoveExported(ctx, user)
 	if err != nil {
 		return nil, internal(ctx, "remove exported words", err)
@@ -481,11 +750,12 @@ func (s *Service) CreateDeckLink(ctx context.Context, req *dictionaryv1.CreateDe
 	if err != nil {
 		return nil, err
 	}
+	defer s.cats.forget(user)
 	sys, err := s.requireExport(ctx, true)
 	if err != nil {
 		return nil, err
 	}
-	d, err := s.buildDeck(ctx, user, req.GetDeckName(), req.GetScope())
+	d, err := s.buildDeck(ctx, user, req.GetDeckName(), exportSource{req.GetScope(), req.GetCategoryId(), req.GetUncategorized(), req.GetWords()})
 	if err != nil {
 		return nil, err
 	}
@@ -511,18 +781,18 @@ func (s *Service) CreateDeckLink(ctx context.Context, req *dictionaryv1.CreateDe
 // token of the link is the whole authorization of the download.
 func (s *Service) DownloadDeck(ctx context.Context, req *dictionaryv1.DownloadDeckRequest) (*dictionaryv1.DownloadDeckResponse, error) {
 	if p := authn.FromContext(ctx); p == nil || !p.IsService() {
-		return nil, apperror.PermissionDenied("a service token is required")
+		return nil, apperror.PermissionDenied("a service token is required").WithReason("service_token_required")
 	}
 	token := req.GetToken()
 	if len(token) < 20 || len(token) > 128 {
-		return nil, apperror.NotFound("the download link does not exist or has expired")
+		return nil, apperror.NotFound("the download link does not exist or has expired").WithReason("download_link_gone")
 	}
 	l, err := s.store.TakeDeckLink(ctx, tokenHash(token), time.Now())
 	switch {
 	case err == nil:
 		return &dictionaryv1.DownloadDeckResponse{Filename: l.Filename, Data: l.Data}, nil
 	case errors.Is(err, store.ErrNotFound):
-		return nil, apperror.NotFound("the download link does not exist or has expired")
+		return nil, apperror.NotFound("the download link does not exist or has expired").WithReason("download_link_gone")
 	default:
 		return nil, internal(ctx, "take deck link", err)
 	}
@@ -535,11 +805,11 @@ func deckName(name string) (string, error) {
 		return defaultDeck, nil
 	}
 	if utf8.RuneCountInString(name) > maxDeckRunes {
-		return "", apperror.InvalidArgument("deck name is longer than 64 characters")
+		return "", apperror.InvalidArgument("deck name is longer than 64 characters").WithReason("deck_name_too_long")
 	}
 	for _, r := range name {
 		if unicode.IsControl(r) {
-			return "", apperror.InvalidArgument("deck name has control characters")
+			return "", apperror.InvalidArgument("deck name has control characters").WithReason("deck_name_control_chars")
 		}
 	}
 	return name, nil
@@ -563,22 +833,22 @@ func (s *Service) UploadImage(ctx context.Context, req *dictionaryv1.UploadImage
 		return nil, err
 	}
 	if s.files == nil {
-		return nil, apperror.FailedPrecondition(CodeImagesDisabled + ": images are not enabled")
+		return nil, apperror.FailedPrecondition(CodeImagesDisabled + ": images are not enabled").WithReason("images_disabled")
 	}
 	if len(req.GetData()) == 0 {
-		return nil, apperror.InvalidArgument(CodeImageInvalid + ": no image")
+		return nil, apperror.InvalidArgument(CodeImageInvalid + ": no image").WithReason("image_unsupported")
 	}
-	res, err := imagestore.Normalize(req.GetData(), s.imgOpts)
+	res, err := filestore.NormalizeImage(req.GetData(), s.imgOpts)
 	switch {
 	case err == nil:
-	case errors.Is(err, imagestore.ErrFormat):
-		return nil, apperror.InvalidArgument(CodeImageInvalid + ": the file is not a png, jpeg, gif or webp image")
-	case errors.Is(err, imagestore.ErrPixels), errors.Is(err, imagestore.ErrTooLarge):
-		return nil, apperror.InvalidArgument(CodeImageTooLarge + ": the image is too large")
+	case errors.Is(err, filestore.ErrImageFormat):
+		return nil, apperror.InvalidArgument(CodeImageInvalid + ": the file is not a png, jpeg, gif or webp image").WithReason("image_unsupported")
+	case errors.Is(err, filestore.ErrPixels), errors.Is(err, filestore.ErrImageTooLarge):
+		return nil, apperror.InvalidArgument(CodeImageTooLarge + ": the image is too large").WithReason("image_too_large")
 	default:
 		return nil, internal(ctx, "normalize image", err)
 	}
-	sha := imagestore.Hash(res.Data)
+	sha := filestore.Hash(res.Data)
 	// the same picture of the same user is stored once
 	switch ex, err := s.store.ImageBySHA(ctx, user, sha); {
 	case err == nil:
@@ -586,15 +856,17 @@ func (s *Service) UploadImage(ctx context.Context, req *dictionaryv1.UploadImage
 	case !errors.Is(err, store.ErrNotFound):
 		return nil, internal(ctx, "find image", err)
 	}
-	used, err := s.store.ImageBytes(ctx, user)
+	used, limit, err := s.storageOf(ctx, user, func(u store.StorageUsage, sys settings.System) (int64, int64) {
+		return u.ImageBytes, effectiveQuota(u.ImageQuota, sys.ImageUserQuota)
+	})
 	if err != nil {
-		return nil, internal(ctx, "image quota", err)
+		return nil, err
 	}
-	if used+int64(len(res.Data)) > s.imgQuota {
-		return nil, apperror.Wrap(codes.ResourceExhausted, CodeImageQuota+": the image storage of the user is full, remove images from cards", nil)
+	if used+int64(len(res.Data)) > limit {
+		return nil, apperror.Wrap(codes.ResourceExhausted, CodeImageQuota+": the image storage of the user is full, remove images from cards", nil).WithReason("image_quota_exceeded")
 	}
 	im := store.Image{ID: uuid.NewString(), UserID: user, ContentType: res.ContentType, Size: len(res.Data), SHA256: sha}
-	ext := imagestore.Ext(res.ContentType)
+	ext := filestore.Ext(res.ContentType)
 	if err := s.files.Write(user, im.ID, ext, res.Data); err != nil {
 		return nil, internal(ctx, "write image", err)
 	}
@@ -603,7 +875,7 @@ func (s *Service) UploadImage(ctx context.Context, req *dictionaryv1.UploadImage
 	case err != nil:
 		_ = s.files.Remove(user, im.ID, ext)
 		if errors.Is(err, store.ErrUnknownUser) {
-			return nil, apperror.Unauthenticated("unknown user")
+			return nil, apperror.Unauthenticated("unknown user").WithReason("unknown_user")
 		}
 		return nil, internal(ctx, "record image", err)
 	case !inserted: // a parallel upload of the same picture won
@@ -620,9 +892,9 @@ func (s *Service) GetImage(ctx context.Context, req *dictionaryv1.GetImageReques
 		return nil, err
 	}
 	if s.files == nil {
-		return nil, apperror.FailedPrecondition(CodeImagesDisabled + ": images are not enabled")
+		return nil, apperror.FailedPrecondition(CodeImagesDisabled + ": images are not enabled").WithReason("images_disabled")
 	}
-	notFound := apperror.NotFound("image not found")
+	notFound := apperror.NotFound("image not found").WithReason("image_not_found")
 	if _, err := uuid.Parse(req.GetId()); err != nil {
 		return nil, notFound
 	}
@@ -634,15 +906,134 @@ func (s *Service) GetImage(ctx context.Context, req *dictionaryv1.GetImageReques
 	default:
 		return nil, internal(ctx, "get image", err)
 	}
-	data, err := s.files.Read(user, im.ID, imagestore.Ext(im.ContentType))
+	data, err := s.files.Read(user, im.ID, filestore.Ext(im.ContentType))
 	switch {
 	case err == nil:
-	case errors.Is(err, imagestore.ErrNotFound):
+	case errors.Is(err, filestore.ErrNotFound):
 		return nil, notFound
 	default:
 		return nil, internal(ctx, "read image", err)
 	}
 	return &dictionaryv1.GetImageResponse{ContentType: im.ContentType, Data: data}, nil
+}
+
+// UploadAudio stores an audio file of the user as it is.
+func (s *Service) UploadAudio(ctx context.Context, req *dictionaryv1.UploadAudioRequest) (*dictionaryv1.UploadAudioResponse, error) {
+	user, err := userID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if s.audio == nil {
+		return nil, apperror.FailedPrecondition(CodeAudioDisabled + ": audio files are not enabled").WithReason("audio_disabled")
+	}
+	ct, err := filestore.SniffAudio(req.GetData(), s.audioMax)
+	switch {
+	case err == nil:
+	case errors.Is(err, filestore.ErrAudioFormat):
+		return nil, apperror.InvalidArgument(CodeAudioInvalid + ": the file is not an mp3, ogg, wav or m4a audio file").WithReason("audio_unsupported")
+	case errors.Is(err, filestore.ErrAudioTooLarge):
+		return nil, apperror.InvalidArgument(CodeAudioTooLarge + ": the audio file is too large").WithReason("audio_too_large")
+	default:
+		return nil, internal(ctx, "check audio", err)
+	}
+	data := req.GetData()
+	sha := filestore.Hash(data)
+	// the same file of the same user is stored once
+	switch ex, err := s.store.AudioBySHA(ctx, user, sha); {
+	case err == nil:
+		return &dictionaryv1.UploadAudioResponse{Id: ex.ID}, nil
+	case !errors.Is(err, store.ErrNotFound):
+		return nil, internal(ctx, "find audio", err)
+	}
+	used, limit, err := s.storageOf(ctx, user, func(u store.StorageUsage, sys settings.System) (int64, int64) {
+		return u.AudioBytes, effectiveQuota(u.AudioQuota, sys.AudioUserQuota)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if used+int64(len(data)) > limit {
+		return nil, apperror.Wrap(codes.ResourceExhausted, CodeAudioQuota+": the audio storage of the user is full, remove audio from cards", nil).WithReason("audio_quota_exceeded")
+	}
+	a := store.Audio{ID: uuid.NewString(), UserID: user, ContentType: ct, Size: len(data), SHA256: sha}
+	ext := filestore.Ext(ct)
+	if err := s.audio.Write(user, a.ID, ext, data); err != nil {
+		return nil, internal(ctx, "write audio", err)
+	}
+	ex, inserted, err := s.store.InsertAudio(ctx, a)
+	switch {
+	case err != nil:
+		_ = s.audio.Remove(user, a.ID, ext)
+		if errors.Is(err, store.ErrUnknownUser) {
+			return nil, apperror.Unauthenticated("unknown user").WithReason("unknown_user")
+		}
+		return nil, internal(ctx, "record audio", err)
+	case !inserted: // a parallel upload of the same file won
+		_ = s.audio.Remove(user, a.ID, ext)
+		return &dictionaryv1.UploadAudioResponse{Id: ex.ID}, nil
+	}
+	return &dictionaryv1.UploadAudioResponse{Id: a.ID}, nil
+}
+
+// GetAudio returns an audio file of the user.
+func (s *Service) GetAudio(ctx context.Context, req *dictionaryv1.GetAudioRequest) (*dictionaryv1.GetAudioResponse, error) {
+	user, err := userID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if s.audio == nil {
+		return nil, apperror.FailedPrecondition(CodeAudioDisabled + ": audio files are not enabled").WithReason("audio_disabled")
+	}
+	notFound := apperror.NotFound("audio not found").WithReason("audio_not_found")
+	if _, err := uuid.Parse(req.GetId()); err != nil {
+		return nil, notFound
+	}
+	a, err := s.store.GetAudio(ctx, user, strings.ToLower(req.GetId()))
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrNotFound):
+		return nil, notFound
+	default:
+		return nil, internal(ctx, "get audio", err)
+	}
+	data, err := s.audio.Read(user, a.ID, filestore.Ext(a.ContentType))
+	switch {
+	case err == nil:
+	case errors.Is(err, filestore.ErrNotFound):
+		return nil, notFound
+	default:
+		return nil, internal(ctx, "read audio", err)
+	}
+	return &dictionaryv1.GetAudioResponse{ContentType: a.ContentType, Data: data}, nil
+}
+
+// attachAudio reads the files of the uploaded audio the cards refer to, for the deck. A missing file is left
+// out of the map: the card has no sound for it.
+func (s *Service) attachAudio(ctx context.Context, user string, cards []anki.Word) error {
+	var ids []string
+	for _, c := range cards {
+		ids = append(ids, cardref.AudioIDs(c.AudioUK, c.AudioUS)...)
+	}
+	if len(ids) == 0 || s.audio == nil {
+		return nil
+	}
+	rows, err := s.store.AudioByIDs(ctx, user, ids)
+	if err != nil {
+		return internal(ctx, "read audio", err)
+	}
+	loaded := map[string]anki.Image{}
+	for _, a := range rows {
+		ext := filestore.Ext(a.ContentType)
+		data, err := s.audio.Read(user, a.ID, ext)
+		if err != nil {
+			logging.FromCtx(ctx).Warn("audio skipped", zap.String("id", a.ID), zap.Error(err))
+			continue
+		}
+		loaded[cardref.AudioPrefix+a.ID] = anki.Image{Data: data, Ext: ext}
+	}
+	for i := range cards {
+		cards[i].AudioFiles = loaded
+	}
+	return nil
 }
 
 // attachImages reads the files of the images the cards refer to, for the deck. A missing image is left out
@@ -661,7 +1052,7 @@ func (s *Service) attachImages(ctx context.Context, user string, cards []anki.Wo
 	}
 	loaded := map[string]anki.Image{}
 	for _, im := range rows {
-		ext := imagestore.Ext(im.ContentType)
+		ext := filestore.Ext(im.ContentType)
 		data, err := s.files.Read(user, im.ID, ext)
 		if err != nil {
 			logging.FromCtx(ctx).Warn("image skipped", zap.String("id", im.ID), zap.Error(err))
@@ -673,4 +1064,13 @@ func (s *Service) attachImages(ctx context.Context, user string, cards []anki.Wo
 		cards[i].Images = loaded
 	}
 	return nil
+}
+
+// wordFilter is the category filter of a request: uncategorized wins over a category id.
+func wordFilter(categoryID string, uncategorized bool) store.WordFilter {
+	// a GET reaches the service as a query string, where the gateway cannot write a bool: the id "uncategorized" says the same
+	if uncategorized || strings.EqualFold(strings.TrimSpace(categoryID), UncategorizedID) {
+		return store.WordFilter{Uncategorized: true}
+	}
+	return store.WordFilter{CategoryID: strings.ToLower(strings.TrimSpace(categoryID))}
 }

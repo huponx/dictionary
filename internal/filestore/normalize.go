@@ -1,6 +1,6 @@
-// Package imagestore normalizes the images of the cards and keeps them as files:
-// <dir>/<user id>/<image id>.<ext>.
-package imagestore
+// Package filestore keeps the files of the cards (images, audio) as <dir>/<user id>/<id>.<ext>, and checks and
+// normalizes what a user uploads.
+package filestore
 
 import (
 	"bytes"
@@ -16,16 +16,16 @@ import (
 )
 
 var (
-	// ErrFormat: not a png, jpeg, gif or webp image (svg is refused on purpose: it can carry scripts).
-	ErrFormat = errors.New("imagestore: not a supported image")
+	// ErrImageFormat: not a png, jpeg, gif or webp image (svg is refused on purpose: it can carry scripts).
+	ErrImageFormat = errors.New("filestore: not a supported image")
 	// ErrPixels: the image has more pixels than the limit; it is refused before it is decoded.
-	ErrPixels = errors.New("imagestore: image has too many pixels")
-	// ErrTooLarge: the image is still larger than the limit after it was shrunk as far as allowed.
-	ErrTooLarge = errors.New("imagestore: image is too large")
+	ErrPixels = errors.New("filestore: image has too many pixels")
+	// ErrImageTooLarge: the image is still larger than the limit after it was shrunk as far as allowed.
+	ErrImageTooLarge = errors.New("filestore: image is too large")
 )
 
-// Options of Normalize.
-type Options struct {
+// ImageOptions of NormalizeImage.
+type ImageOptions struct {
 	// MaxBytes is the largest result.
 	MaxBytes int
 	// MaxDim is the largest side of the result.
@@ -34,9 +34,9 @@ type Options struct {
 	MaxPixels int
 }
 
-// Result is a normalized image: the bytes of a jpeg (opaque images) or a png (images with transparency)
+// ImageResult is a normalized image: the bytes of a jpeg (opaque images) or a png (images with transparency)
 // without any metadata.
-type Result struct {
+type ImageResult struct {
 	Data        []byte
 	ContentType string
 }
@@ -46,8 +46,8 @@ const (
 	minDim      = 128
 )
 
-// sniff returns the format by the magic bytes, "" when it is none of the supported ones.
-func sniff(b []byte) string {
+// sniffImage returns the format by the magic bytes, "" when it is none of the supported ones.
+func sniffImage(b []byte) string {
 	switch {
 	case bytes.HasPrefix(b, []byte("\x89PNG\r\n\x1a\n")):
 		return "png"
@@ -61,25 +61,25 @@ func sniff(b []byte) string {
 	return ""
 }
 
-// Normalize checks the bytes, shrinks the image to MaxDim, turns it upright by its EXIF orientation and
+// NormalizeImage checks the bytes, shrinks the image to MaxDim, turns it upright by its EXIF orientation and
 // encodes it again, which drops the metadata (EXIF, GPS). An animated gif keeps its first frame. The result
 // is at most MaxBytes: when it is larger the quality and then the size go down by steps; if it never fits
-// the error is ErrTooLarge.
-func Normalize(data []byte, o Options) (*Result, error) {
-	format := sniff(data)
+// the error is ErrImageTooLarge.
+func NormalizeImage(data []byte, o ImageOptions) (*ImageResult, error) {
+	format := sniffImage(data)
 	if format == "" {
-		return nil, ErrFormat
+		return nil, ErrImageFormat
 	}
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil || cfg.Width < 1 || cfg.Height < 1 {
-		return nil, ErrFormat
+		return nil, ErrImageFormat
 	}
 	if o.MaxPixels > 0 && cfg.Width*cfg.Height > o.MaxPixels {
 		return nil, ErrPixels
 	}
 	src, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
-		return nil, ErrFormat
+		return nil, ErrImageFormat
 	}
 	orientation := 1
 	if format == "jpeg" {
@@ -102,7 +102,7 @@ func Normalize(data []byte, o Options) (*Result, error) {
 				return nil, err
 			}
 			if o.MaxBytes <= 0 || len(out) <= o.MaxBytes {
-				return &Result{Data: out, ContentType: ct}, nil
+				return &ImageResult{Data: out, ContentType: ct}, nil
 			}
 			if alpha { // png has no quality: only the size helps
 				break
@@ -111,7 +111,7 @@ func Normalize(data []byte, o Options) (*Result, error) {
 		b := img.Bounds()
 		long := max(b.Dx(), b.Dy())
 		if long <= minDim {
-			return nil, ErrTooLarge
+			return nil, ErrImageTooLarge
 		}
 		img = fit(img, max(minDim, int(math.Round(float64(long)*0.75))))
 	}

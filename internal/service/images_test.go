@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/huponx/dictionary/internal/imagestore"
+	"github.com/huponx/dictionary/internal/filestore"
 	"github.com/huponx/gocommon/authn"
 	"github.com/huponx/gocommon/jwtx"
 	dictionaryv1 "github.com/huponx/protogen/go/dictionary/v1"
@@ -24,8 +24,8 @@ func otherCtx() context.Context {
 func imageService(t *testing.T, quota int64) (*Service, *fakeStore, *fakeDecks) {
 	t.Helper()
 	st, d := newFakeStore(), &fakeDecks{}
-	s := newService(st, d).WithImages(&imagestore.Store{Dir: t.TempDir()},
-		imagestore.Options{MaxBytes: 300 << 10, MaxDim: 1024, MaxPixels: 25_000_000}, quota)
+	s := newService(st, d).WithImages(&filestore.Store{Dir: t.TempDir()},
+		filestore.ImageOptions{MaxBytes: 300 << 10, MaxDim: 1024, MaxPixels: 25_000_000}, quota)
 	return s, st, d
 }
 

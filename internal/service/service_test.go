@@ -5,14 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/huponx/dictionary/internal/anki"
 	"github.com/huponx/dictionary/internal/cardref"
 	"github.com/huponx/dictionary/internal/lookup"
+	"github.com/huponx/dictionary/internal/settings"
+	"github.com/huponx/dictionary/internal/srs"
 	"github.com/huponx/dictionary/internal/store"
 	"github.com/huponx/gocommon/authn"
 	"github.com/huponx/gocommon/jwtx"
@@ -34,6 +38,13 @@ func TestEveryRPCHasAPermission(t *testing.T) {
 	seen := map[string]bool{}
 	for _, m := range dictionaryv1.DictionaryService_ServiceDesc.Methods {
 		full := "/" + dictionaryv1.DictionaryService_ServiceDesc.ServiceName + "/" + m.MethodName
+		seen[full] = true
+		if Permissions[full] == "" {
+			t.Errorf("%s has no entry in Permissions", full)
+		}
+	}
+	for _, m := range dictionaryv1.DictionaryService_ServiceDesc.Streams {
+		full := "/" + dictionaryv1.DictionaryService_ServiceDesc.ServiceName + "/" + m.StreamName
 		seen[full] = true
 		if Permissions[full] == "" {
 			t.Errorf("%s has no entry in Permissions", full)
@@ -87,10 +98,25 @@ type fakeStore struct {
 	exported   map[string]bool
 	clock      time.Time
 	failMark   bool
+	exp        fakeExports
+	listCalls  int                       // calls of ListCategories
 	lastRemove bool                      // the remove argument of the last MarkExported
 	links      map[string]store.DeckLink // by hash of the token
 	settings   map[string]json.RawMessage
 	images     map[string]store.Image // by id
+	audio      map[string]store.Audio // by id
+	review     map[string]fakeReview  // by word
+	bonus      store.ReviewBonus
+	log        []loggedGrade
+	params     *store.FSRSParams
+	logs       [][]srs.Review // what ReviewLogs returns
+	lastClaim  time.Time
+	locked     bool
+	lockMu     sync.Mutex
+	cats       []store.Category           // the categories of the user (Total and New are not kept)
+	wordCats   map[string]map[string]bool // category ids by word
+	quotas     store.Quotas               // the own limits of the user
+	unknown    bool                       // GetStorageUsage: there is no such user
 }
 
 func (f *fakeStore) Settings(context.Context) (map[string]json.RawMessage, error) {
@@ -115,28 +141,84 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{rows: map[string]store.SavedWord{}, exported: map[string]bool{}, links: map[string]store.DeckLink{}, clock: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 }
 
-func (f *fakeStore) SaveWord(_ context.Context, user string, w store.SavedWord, max int) (int, error) {
+func (f *fakeStore) contentBytes() int64 {
+	var n int64
+	for _, r := range f.rows {
+		n += int64(len(r.Content))
+	}
+	return n
+}
+
+func (f *fakeStore) GetStorageUsage(context.Context, string) (store.StorageUsage, error) {
+	if f.unknown {
+		return store.StorageUsage{}, store.ErrUnknownUser
+	}
+	u := store.StorageUsage{ContentBytes: f.contentBytes(), ContentQuota: f.quotas.Content, ImageQuota: f.quotas.Image, AudioQuota: f.quotas.Audio}
+	for _, im := range f.images {
+		u.ImageBytes += int64(im.Size)
+	}
+	for _, a := range f.audio {
+		u.AudioBytes += int64(a.Size)
+	}
+	return u, nil
+}
+
+func (f *fakeStore) SetStorageQuota(_ context.Context, _ string, q store.Quotas) error {
+	if f.unknown {
+		return store.ErrUnknownUser
+	}
+	f.quotas = q
+	return nil
+}
+
+func (f *fakeStore) SaveWord(_ context.Context, user string, w store.SavedWord, max int, contentQuota int64, categoryIDs []string) (int, error) {
+	for _, id := range categoryIDs {
+		if f.category(id) < 0 {
+			return 0, store.ErrNotFound
+		}
+	}
 	for _, id := range cardref.IDs(w.Content) {
 		if im, ok := f.images[id]; !ok || im.UserID != user {
 			return 0, store.ErrUnknownImage
 		}
 	}
+	for _, id := range cardref.AudioIDs(w.AudioUK, w.AudioUS) {
+		if a, ok := f.audio[id]; !ok || a.UserID != user {
+			return 0, store.ErrUnknownAudio
+		}
+	}
 	if _, ok := f.rows[w.Word]; !ok && len(f.rows) >= max {
 		return 0, store.ErrLimit
+	}
+	if delta := int64(len(w.Content) - len(f.rows[w.Word].Content)); delta > 0 {
+		limit := contentQuota
+		if f.quotas.Content != nil {
+			limit = *f.quotas.Content
+		}
+		if f.contentBytes()+delta > limit {
+			return 0, store.ErrBytesLimit
+		}
 	}
 	f.clock = f.clock.Add(time.Second)
 	w.CreatedAt = f.clock
 	f.rows[w.Word] = w
+	for _, id := range categoryIDs {
+		f.link(w.Word, id)
+	}
 	return len(f.rows), nil
 }
-func (f *fakeStore) CountPending(context.Context, string) (int, int, error) {
-	fresh := 0
+func (f *fakeStore) CountPending(_ context.Context, _ string, flt store.WordFilter) (int, int, bool, error) {
+	total, fresh := 0, 0
 	for _, r := range f.rows {
+		if !f.match(r.Word, flt) {
+			continue
+		}
+		total++
 		if !r.Exported {
 			fresh++
 		}
 	}
-	return len(f.rows), fresh, nil
+	return total, fresh, false, nil
 }
 func (f *fakeStore) sorted() []store.SavedWord {
 	var out []store.SavedWord
@@ -146,7 +228,7 @@ func (f *fakeStore) sorted() []store.SavedWord {
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out
 }
-func (f *fakeStore) ListPending(_ context.Context, _ string, after time.Time, afterWord, query string, limit int) ([]store.SavedWord, error) {
+func (f *fakeStore) ListPending(_ context.Context, _ string, after time.Time, afterWord, query string, flt store.WordFilter, limit int) ([]store.SavedWord, error) {
 	all := f.sorted()
 	var out []store.SavedWord
 	for i := len(all) - 1; i >= 0; i-- { // newest first
@@ -156,6 +238,13 @@ func (f *fakeStore) ListPending(_ context.Context, _ string, after time.Time, af
 		if query != "" && !strings.Contains(strings.ToLower(all[i].Word), strings.ToLower(query)) {
 			continue
 		}
+		if !f.match(all[i].Word, flt) {
+			continue
+		}
+		all[i].CategoryIDs = f.idsOf(all[i].Word)
+		if r, ok := f.review[all[i].Word]; ok {
+			all[i].NextReview, all[i].Learning = r.state.Due, r.state.Learning
+		}
 		out = append(out, all[i])
 		if len(out) == limit {
 			break
@@ -163,10 +252,21 @@ func (f *fakeStore) ListPending(_ context.Context, _ string, after time.Time, af
 	}
 	return out, nil
 }
-func (f *fakeStore) Pending(_ context.Context, _ string, scope store.Scope) ([]store.SavedWord, error) {
+func (f *fakeStore) Pending(_ context.Context, _ string, scope store.Scope, flt store.WordFilter, words []string, limit int) ([]store.SavedWord, error) {
 	var out []store.SavedWord
+	defer func() {
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
+		}
+	}()
 	for _, r := range f.sorted() {
-		if scope == store.ScopeAll || !r.Exported {
+		if words != nil {
+			if slices.Contains(words, r.Word) {
+				out = append(out, r)
+			}
+			continue
+		}
+		if f.match(r.Word, flt) && (scope == store.ScopeAll || !r.Exported) {
 			out = append(out, r)
 		}
 	}
@@ -219,15 +319,6 @@ func (f *fakeStore) TakeDeckLink(_ context.Context, h []byte, now time.Time) (*s
 	return &l, nil
 }
 
-func (f *fakeStore) ImageBytes(_ context.Context, user string) (int64, error) {
-	var n int64
-	for _, im := range f.images {
-		if im.UserID == user {
-			n += int64(im.Size)
-		}
-	}
-	return n, nil
-}
 func (f *fakeStore) ImageBySHA(_ context.Context, user string, sha []byte) (*store.Image, error) {
 	for _, im := range f.images {
 		if im.UserID == user && string(im.SHA256) == string(sha) {
@@ -260,6 +351,40 @@ func (f *fakeStore) InsertImage(ctx context.Context, im store.Image) (*store.Ima
 	}
 	f.images[im.ID] = im
 	return &im, true, nil
+}
+
+func (f *fakeStore) AudioBySHA(_ context.Context, user string, sha []byte) (*store.Audio, error) {
+	for _, a := range f.audio {
+		if a.UserID == user && string(a.SHA256) == string(sha) {
+			return &a, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+func (f *fakeStore) GetAudio(_ context.Context, user, id string) (*store.Audio, error) {
+	if a, ok := f.audio[id]; ok && a.UserID == user {
+		return &a, nil
+	}
+	return nil, store.ErrNotFound
+}
+func (f *fakeStore) AudioByIDs(_ context.Context, user string, ids []string) ([]store.Audio, error) {
+	var out []store.Audio
+	for _, id := range ids {
+		if a, ok := f.audio[id]; ok && a.UserID == user {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) InsertAudio(ctx context.Context, a store.Audio) (*store.Audio, bool, error) {
+	if ex, err := f.AudioBySHA(ctx, a.UserID, a.SHA256); err == nil {
+		return ex, false, nil
+	}
+	if f.audio == nil {
+		f.audio = map[string]store.Audio{}
+	}
+	f.audio[a.ID] = a
+	return &a, true, nil
 }
 
 type fakeDecks struct {
@@ -352,7 +477,7 @@ func TestSaveWord(t *testing.T) {
 
 	for _, req := range []*dictionaryv1.SaveWordRequest{
 		{Word: "a/b"},
-		{Word: "ok", Content: strings.Repeat("x", maxContentBytes+1)},
+		{Word: "ok", Content: strings.Repeat("x", settings.DefaultMaxContentBytes+1)},
 		{Word: "ok", AudioUs: "https://evil.example/a.mp3"},
 		{Word: "ok", AudioUk: "http://api.dictionaryapi.dev/a.mp3"},
 	} {

@@ -18,12 +18,12 @@ application:
       - name: tmp
         emptyDir:
           sizeLimit: 128Mi
-      # Card images (DICTIONARY_IMAGE_DIR). The claim is created outside the chart (mm-ansible, tag `pvc`) and
+      # Card files, images and audio (DICTIONARY_FILES_DIR: <dir>/images and <dir>/audio). The claim is created outside the chart (mm-ansible, tag `pvc`) and
       # must exist before the pod starts, or it stays Pending. ReadWriteOnce hostpath works on a one-node cluster
       # only (also with several replicas); on more nodes use a ReadWriteMany class or object storage.
-      - name: images
+      - name: files
         persistentVolumeClaim:
-          claimName: dictionary-images
+          claimName: dictionary-files
     container:
       image:
         repository: huponx/dictionary
@@ -32,8 +32,8 @@ application:
       volumeMounts:
         - name: tmp
           mountPath: /tmp
-        - name: images
-          mountPath: /data/images
+        - name: files
+          mountPath: /data/files
       # config.data below becomes the ConfigMap <name>-env-vars, loaded as environment variables.
       envFrom:
         - configMapRef:
@@ -70,8 +70,8 @@ application:
       # The preferences of the users are kept by identity: DICTIONARY_IDENTITY_ADDR, DICTIONARY_TOKEN_URL and
       # DICTIONARY_CLIENT_ID (config) and DICTIONARY_CLIENT_SECRET (secret) are set in the Application of mm-deploy.
       DICTIONARY_IDENTITY_AUDIENCE: identity
-      # Where the images of the cards are stored (the PVC mounted above).
-      DICTIONARY_IMAGE_DIR: /data/images
+      # Where the images and the audio of the cards are stored (the PVC mounted above).
+      DICTIONARY_FILES_DIR: /data/files
   # Secret values stay out of git: reference existing Secrets (mm-deploy overrides this list).
   secrets: []
   autoscaling:

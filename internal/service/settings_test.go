@@ -26,7 +26,7 @@ func (f *fakePrefs) Put(_ context.Context, s string) error {
 
 func allOn(max int32) *dictionaryv1.Settings {
 	return &dictionaryv1.Settings{MaxSavedWords: max, AllowExportDeck: true, AllowExportLink: true, EnglishEnabled: true, EnglishViEnabled: true,
-		RemoveAfterExport: true, ExportedRetentionHours: 168}
+		RemoveAfterExport: true, ExportedRetentionHours: 168, MaxCategories: 50, MaxCategoryNameLength: 40}
 }
 
 func TestSettingsDefaultsFromConfig(t *testing.T) {
@@ -58,7 +58,7 @@ func TestUpdateSettingsWritesOnlyChangedRows(t *testing.T) {
 func TestUpdateSettingsValidation(t *testing.T) {
 	s := newService(newFakeStore(), &fakeDecks{})
 	bad := []*dictionaryv1.Settings{
-		nil, allOn(0), allOn(1001),
+		nil, allOn(0), allOn(1_000_001),
 		{MaxSavedWords: 10, AllowExportDeck: true},
 	}
 	for i, in := range bad {
@@ -232,5 +232,152 @@ func TestFreshDeckPreference(t *testing.T) {
 	p.raw = p.written
 	if r, err := s.GetMySettings(userCtx(), &dictionaryv1.GetMySettingsRequest{}); err != nil || !r.User.FreshDeck {
 		t.Fatalf("%+v, %v", r, err)
+	}
+}
+
+func TestReviewMaxPerDaySetting(t *testing.T) {
+	p := &fakePrefs{}
+	s := newService(newFakeStore(), &fakeDecks{}).WithPrefs(p)
+	if r, err := s.GetMySettings(userCtx(), &dictionaryv1.GetMySettingsRequest{}); err != nil || r.User.ReviewMaxPerDay != 200 {
+		t.Fatalf("%+v, %v", r, err)
+	}
+	put := func(n int32) error {
+		_, err := s.UpdateMySettings(userCtx(), &dictionaryv1.UpdateMySettingsRequest{User: &dictionaryv1.UserSettings{
+			EnglishEnabled: true, MaxLookupWords: 5, ReviewMaxPerDay: n}})
+		return err
+	}
+	for _, n := range []int32{0, 500, 9999} {
+		if err := put(n); err != nil || settings.ParseUser(p.written).ReviewMaxPerDay != int(n) {
+			t.Fatalf("%d: %v %s", n, err, p.written)
+		}
+	}
+	p.raw = p.written
+	if r, _ := s.GetMySettings(userCtx(), &dictionaryv1.GetMySettingsRequest{}); r.User.ReviewMaxPerDay != 9999 {
+		t.Fatalf("%+v", r.User)
+	}
+	p.written = ""
+	for _, n := range []int32{-1, 10000} {
+		if err := put(n); code(err) != codes.InvalidArgument || p.written != "" {
+			t.Errorf("%d: %v", n, err)
+		}
+	}
+}
+
+func TestReviewNewPerDaySetting(t *testing.T) {
+	p := &fakePrefs{}
+	s := newService(newFakeStore(), &fakeDecks{}).WithPrefs(p)
+	r, err := s.GetMySettings(userCtx(), &dictionaryv1.GetMySettingsRequest{})
+	if err != nil || r.User.ReviewNewPerDay != 10 {
+		t.Fatalf("%+v, %v", r, err)
+	}
+	put := func(n int32) error {
+		_, err := s.UpdateMySettings(userCtx(), &dictionaryv1.UpdateMySettingsRequest{User: &dictionaryv1.UserSettings{
+			EnglishEnabled: true, MaxLookupWords: 5, ReviewNewPerDay: n}})
+		return err
+	}
+	for _, n := range []int32{0, 25, 100} {
+		if err := put(n); err != nil || settings.ParseUser(p.written).ReviewNewPerDay != int(n) {
+			t.Fatalf("%d: %v %s", n, err, p.written)
+		}
+	}
+	p.raw = p.written
+	if r, _ := s.GetMySettings(userCtx(), &dictionaryv1.GetMySettingsRequest{}); r.User.ReviewNewPerDay != 100 {
+		t.Fatalf("%+v", r.User)
+	}
+	p.written = ""
+	for _, n := range []int32{-1, 101} {
+		if err := put(n); code(err) != codes.InvalidArgument || p.written != "" {
+			t.Errorf("%d: %v", n, err)
+		}
+	}
+}
+
+func TestUpdateSettingsCategoryLimits(t *testing.T) {
+	st := newFakeStore()
+	s := newService(st, &fakeDecks{})
+	in := allOn(50)
+	in.MaxCategories, in.MaxCategoryNameLength = 7, 12
+	r, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: in})
+	if err != nil || r.Settings.MaxCategories != 7 || r.Settings.MaxCategoryNameLength != 12 {
+		t.Fatalf("%+v, %v", r, err)
+	}
+	g, _ := s.GetSettings(userCtx(), &dictionaryv1.GetSettingsRequest{})
+	if g.Settings.MaxCategories != 7 || g.Settings.MaxCategoryNameLength != 12 {
+		t.Fatalf("%+v", g.Settings)
+	}
+	// a client that does not send them keeps the current values
+	old := allOn(50)
+	old.MaxCategories, old.MaxCategoryNameLength = 0, 0
+	if r, err = s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: old}); err != nil || r.Settings.MaxCategories != 7 {
+		t.Fatalf("%+v, %v", r, err)
+	}
+	for _, bad := range [][2]int32{{settings.MaxCategoriesLimit + 1, 40}, {50, settings.MaxCategoryNameLimit + 1}, {-1, 40}} {
+		in := allOn(50)
+		in.MaxCategories, in.MaxCategoryNameLength = bad[0], bad[1]
+		if _, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: in}); code(err) != codes.InvalidArgument {
+			t.Errorf("%v accepted: %v", bad, err)
+		}
+	}
+}
+
+func TestUpdateSettingsAcceptsAMillionWords(t *testing.T) {
+	s := newService(newFakeStore(), &fakeDecks{})
+	r, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: allOn(1_000_000)})
+	if err != nil || r.Settings.MaxSavedWords != 1_000_000 {
+		t.Fatalf("%+v, %v", r, err)
+	}
+}
+
+func TestExportSizeSettingsAreBoundedByTheCeilings(t *testing.T) {
+	st := newFakeStore()
+	s := newService(st, &fakeDecks{})
+	s.cfg.ExportMaxBytesCeiling, s.cfg.ExportPartMaxBytesCeiling = 10<<20, 50<<20
+	g, _ := s.GetSettings(userCtx(), &dictionaryv1.GetSettingsRequest{})
+	if g.Settings.ExportMaxBytes != 3<<20 || g.Settings.ExportPartMaxBytes != 3<<20 ||
+		g.Settings.ExportMaxBytesCeiling != 10<<20 || g.Settings.ExportPartMaxBytesCeiling != 50<<20 {
+		t.Fatalf("defaults: %+v", g.Settings)
+	}
+	for name, mut := range map[string]func(*dictionaryv1.Settings){
+		"sync over the ceiling": func(in *dictionaryv1.Settings) { in.ExportMaxBytes = 10<<20 + 1 },
+		"part over the ceiling": func(in *dictionaryv1.Settings) { in.ExportPartMaxBytes = 50<<20 + 1 },
+		"part under 64 KiB":     func(in *dictionaryv1.Settings) { in.ExportPartMaxBytes = 1000 },
+	} {
+		in := allOn(10)
+		mut(in)
+		if _, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: in}); code(err) != codes.InvalidArgument {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	in := allOn(10)
+	in.ExportMaxBytes, in.ExportPartMaxBytes = 10<<20, 25<<20
+	in.ExportMaxBytesCeiling = 1 // read only: ignored
+	r, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: in})
+	if err != nil || r.Settings.ExportMaxBytes != 10<<20 || r.Settings.ExportPartMaxBytes != 25<<20 || r.Settings.ExportMaxBytesCeiling != 10<<20 {
+		t.Fatalf("%+v, %v", r, err)
+	}
+	// a client that predates the settings sends none: the stored values stay
+	old := allOn(10)
+	if r, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: old}); err != nil || r.Settings.ExportPartMaxBytes != 25<<20 {
+		t.Fatalf("%+v, %v", r, err)
+	}
+}
+
+func TestUpdateSettingsExportSyncMaxWords(t *testing.T) {
+	st := newFakeStore()
+	s := newService(st, &fakeDecks{})
+	in := allOn(50) // a client that predates the setting sends 0: the current value stays
+	if r, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: in}); err != nil || r.Settings.ExportSyncMaxWords != 2000 {
+		t.Fatalf("%+v, %v", r, err)
+	}
+	in.ExportSyncMaxWords = 4000
+	if r, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: in}); err != nil || r.Settings.ExportSyncMaxWords != 4000 {
+		t.Fatalf("%+v, %v", r, err)
+	}
+	if string(st.settings["export_sync_max_words"]) != "4000" {
+		t.Errorf("rows: %v", st.settings)
+	}
+	in.ExportSyncMaxWords = 5001
+	if _, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: in}); code(err) != codes.InvalidArgument {
+		t.Errorf("5001: %v", err)
 	}
 }

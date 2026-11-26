@@ -1,0 +1,81 @@
+# Values of the go-application chart live under `application:` (alias of the dependency).
+# image.tag is written at release time (update-deployment-values); the default only keeps `helm template` working.
+#
+# The worker runs the export jobs and the cleanup of dictionary. It listens on one HTTP port (8081, /healthz and
+# /readyz for the probes), no gRPC and no Service: nobody calls it, it reads the job queue in Postgres. It needs no
+# identity (issuer, JWKS, client secret). Without a worker the export jobs of the API stay `queued`.
+application:
+  deployment:
+    # The image runs as the distroless `nonroot` user (65532).
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      # The files volume is a hostpath PVC owned by root: fsGroup makes it writable for uid 65532.
+      fsGroup: 65532
+    volumes:
+      # The Anki library writes every deck through a temporary SQLite file (a part is up to 50 MiB by default).
+      - name: tmp
+        emptyDir:
+          sizeLimit: 512Mi
+      # The same claim as the dictionary API: the worker writes exports/ and reads images/ and audio/ when it builds a
+      # deck, and deletes files; the API reads exports/ to stream a part. The claim is created outside the chart
+      # (mm-ansible, tag `pvc`). ReadWriteOnce hostpath works on a one-node cluster only (both pods on the same
+      # node); on more nodes use a ReadWriteMany class or object storage.
+      - name: files
+        persistentVolumeClaim:
+          claimName: dictionary-files
+    container:
+      image:
+        repository: huponx/dictionary-worker
+        tag: "0.0.0"
+      # Probes only: the worker exposes /healthz and /readyz, no gRPC.
+      port: 8081
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: files
+          mountPath: /data/files
+      # config.data below becomes the ConfigMap <name>-env-vars, loaded as environment variables.
+      envFrom:
+        - configMapRef:
+            name: '{{ include "common.name" . }}-env-vars'
+      startupProbe:
+        httpGet:
+          path: /healthz
+          port: 8081
+        failureThreshold: 30
+        periodSeconds: 2
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 8081
+        periodSeconds: 20
+      readinessProbe:
+        httpGet:
+          path: /readyz
+          port: 8081
+        periodSeconds: 10
+      # A job builds a part in memory: 2-3 times its size (up to 50 MiB), two jobs at once per replica. Measure with
+      # real exports and adjust the limit together with DICTIONARY_EXPORT_PART_MAX_BYTES_CEILING.
+      resources:
+        limits:
+          cpu: "1"
+          memory: 1Gi
+        requests:
+          cpu: 50m
+          memory: 256Mi
+  service:
+    enabled: false
+  config:
+    data:
+      HEALTH_ADDR: ":8081"
+      LOG_ENCODING: json
+      # Where the files of the cards and of the exports are (the PVC mounted above).
+      DICTIONARY_FILES_DIR: /data/files
+  # Secret values stay out of git: reference existing Secrets (mm-deploy overrides this list).
+  secrets: []
+  autoscaling:
+    enabled: false
+  pdb:
+    enabled: false
