@@ -13,6 +13,7 @@ import (
 
 	"github.com/huponx/dictionary/internal/anki"
 	"github.com/huponx/dictionary/internal/appconfig"
+	"github.com/huponx/dictionary/internal/catalog"
 	"github.com/huponx/dictionary/internal/filestore"
 	"github.com/huponx/dictionary/internal/identityclient"
 	"github.com/huponx/dictionary/internal/lookup"
@@ -24,8 +25,10 @@ import (
 	"github.com/huponx/gocommon/grpcserver"
 	"github.com/huponx/gocommon/jwtx"
 	"github.com/huponx/gocommon/logging"
+	"github.com/huponx/gocommon/permsync"
 	"github.com/huponx/gocommon/tokenexchange"
 	dictionaryv1 "github.com/huponx/protogen/go/dictionary/v1"
+	identityv1 "github.com/huponx/protogen/go/identity/v1"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
@@ -72,10 +75,9 @@ func main() {
 	if cfg.ViFallbackMT {
 		vi.Translator = lookup.NewMyMemory(cfg.MyMemoryURL, httpClient, cfg.UserAgent)
 	}
-	looker := lookup.New(map[lookup.Dictionary]lookup.Provider{
-		lookup.English:           freeDict,
-		lookup.EnglishVietnamese: vi,
-	}, cfg.LookupCacheTTL, cfg.LookupCacheSize)
+	// The dictionaries are listed in the catalog package; a provider per id goes here.
+	registry := catalog.Registry(map[string]lookup.Provider{catalog.English: freeDict, catalog.EnglishVietnamese: vi})
+	looker := lookup.New(registry, cfg.LookupCacheTTL, cfg.LookupCacheSize)
 
 	decks := &anki.Builder{
 		Client: &http.Client{Timeout: cfg.HTTPTimeout}, AllowedHosts: cfg.Hosts(), MaxBytes: cfg.ExportMaxBytesCeiling, Log: log,
@@ -88,7 +90,7 @@ func main() {
 		grpcserver.WithMethodPermissions(service.Permissions),
 		grpcserver.WithMaxMsgSize(1<<20, cfg.ExportMaxBytesCeiling+maxMessageMargin),
 	)
-	svc := service.New(looker, st, decks, service.Config{
+	svc := service.New(looker, registry, st, decks, service.Config{
 		MaxSavedWords: cfg.MaxSavedWords, ExportedRetentionHours: int(cfg.ExportedRetention / time.Hour), AudioHosts: cfg.Hosts(), DeckLinkTTL: cfg.DeckLinkTTL,
 		ExportSyncMax: cfg.ExportSyncMax, ExportJobTTL: cfg.ExportJobTTL,
 		ExportMaxBytes: cfg.ExportMaxBytes, ExportPartMaxBytes: cfg.ExportPartMaxBytes,
@@ -109,6 +111,7 @@ func main() {
 	} else {
 		log.Warn("DICTIONARY_FILES_DIR is not set: the images and the audio files of the cards are disabled")
 	}
+	var registrar permsync.Registrar
 	if cfg.IdentityAddr != "" {
 		// preferences of the users: identity, called on behalf of the user of the request
 		exch, err := tokenexchange.New(tokenexchange.Config{TokenURL: cfg.TokenURL, ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret})
@@ -122,6 +125,15 @@ func main() {
 			log.Fatal("identity client", zap.Error(err))
 		}
 		defer conn.Close()
+		// the permissions of this service: identity, called as the service itself
+		regConn, err := grpcclient.Dial(ctx, cfg.IdentityAddr,
+			grpcclient.WithLogger(log), grpcclient.WithInsecure(cfg.IdentityInsecure),
+			grpcclient.WithServiceToken(exch, cfg.IdentityAudience))
+		if err != nil {
+			log.Fatal("identity client", zap.Error(err))
+		}
+		defer regConn.Close()
+		registrar = identityv1.NewIdentityServiceClient(regConn)
 		svc.WithPrefs(identityclient.New(conn))
 		svc.WithScheduleCache(scheduleCacheTTL, scheduleCacheUsers)
 	} else {
@@ -140,6 +152,22 @@ func main() {
 		log.Info("dictionary grpc listening", zap.String("addr", cfg.Addr()))
 		errCh <- srv.GRPC.Serve(lis)
 	}()
+
+	// Not ready until identity has the permissions of this service: a changed set changes what many users may do. The
+	// port is open (so the probe gets an answer) but reports NOT_SERVING; after the timeout the process exits non-zero.
+	if registrar != nil {
+		srv.SetServing("", false)
+		if err := permsync.RegisterWithRetry(ctx, log, registrar, "dictionary", cfg.PermissionsSyncTimeout,
+			dictionaryv1.File_dictionary_v1_permissions_proto); err != nil {
+			if ctx.Err() == nil {
+				log.Error("permission sync", zap.Error(err))
+				os.Exit(1)
+			}
+		}
+		srv.SetServing("", true)
+	} else {
+		log.Warn("DICTIONARY_IDENTITY_ADDR is not set: the permissions of the dictionary are not registered with identity")
+	}
 
 	select {
 	case <-ctx.Done():

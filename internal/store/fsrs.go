@@ -123,25 +123,25 @@ func (s *Store) ReviewLogs(ctx context.Context, userID string, limit int) ([][]s
 	limit = min(limit, maxLogReviews)
 	rows, err := s.pool.Query(ctx, `
 		WITH recent AS (
-			SELECT DISTINCT word FROM (
-				SELECT word FROM dictionary_review_log WHERE user_id = $1 ORDER BY reviewed_at DESC LIMIT $2
+			SELECT DISTINCT grp, word FROM (
+				SELECT grp, word FROM dictionary_review_log WHERE user_id = $1 ORDER BY reviewed_at DESC LIMIT $2
 			) t
 		)
-		SELECT l.word, l.reviewed_at, l.grade, l.elapsed_seconds
-		FROM recent JOIN dictionary_review_log l ON l.user_id = $1 AND l.word = recent.word
-		ORDER BY l.word, l.reviewed_at`, userID, limit)
+		SELECT l.grp, l.word, l.reviewed_at, l.grade, l.elapsed_seconds
+		FROM recent JOIN dictionary_review_log l ON l.user_id = $1 AND l.grp = recent.grp AND l.word = recent.word
+		ORDER BY l.grp, l.word, l.reviewed_at`, userID, limit)
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	defer rows.Close()
 	var out [][]srs.Review
-	var cur string
+	var cur wordKey
 	for rows.Next() {
-		var word string
+		var word wordKey
 		var at time.Time
 		var grade int16
 		var elapsed int64
-		if err := rows.Scan(&word, &at, &grade, &elapsed); err != nil {
+		if err := rows.Scan(&word.Group, &word.Word, &at, &grade, &elapsed); err != nil {
 			return nil, err
 		}
 		if word != cur || len(out) == 0 {

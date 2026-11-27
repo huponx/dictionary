@@ -116,22 +116,22 @@ func TestSaveWordRefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	card := `<p>x</p><img src="dictimg:` + up.Id + `">`
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", Content: card}); err != nil {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", Content: card}); err != nil {
 		t.Fatal(err)
 	}
 	// the image of another user cannot be used, nor an unknown one
-	if _, err := s.SaveWord(otherCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", Content: card}); code(err) != codes.InvalidArgument {
+	if _, err := s.SaveWord(otherCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", Content: card}); code(err) != codes.InvalidArgument {
 		t.Fatalf("other user's image: %v", err)
 	}
 	unknown := `<img src="dictimg:99999999-9999-4999-8999-999999999999">`
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", Content: unknown}); code(err) != codes.InvalidArgument {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", Content: unknown}); code(err) != codes.InvalidArgument {
 		t.Fatalf("unknown image: %v", err)
 	}
 	var many strings.Builder
 	for i := 0; i < 21; i++ {
 		many.WriteString(`<img src="dictimg:` + strings.Replace("00000000-0000-4000-8000-0000000000XX", "XX", string(rune('a'+i))+string(rune('a'+i)), 1) + `">`)
 	}
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", Content: many.String()}); code(err) != codes.InvalidArgument {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", Content: many.String()}); code(err) != codes.InvalidArgument {
 		t.Fatalf("too many images: %v", err)
 	}
 }
@@ -140,10 +140,10 @@ func TestExportAttachesImages(t *testing.T) {
 	s, _, decks := imageService(t, 1<<20)
 	up, _ := s.UploadImage(userCtx(), &dictionaryv1.UploadImageRequest{Data: pngBytes(t, 30, 30, 3)})
 	card := `<img src="dictimg:` + up.Id + `">`
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", Content: card}); err != nil {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", Content: card}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{}); err != nil {
+	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(decks.built) != 1 {

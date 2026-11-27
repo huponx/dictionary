@@ -50,18 +50,22 @@ func toProtoCategory(c store.Category) *dictionaryv1.Category {
 }
 
 // ListCategories lists the categories of the user with their word counts.
-func (s *Service) ListCategories(ctx context.Context, _ *dictionaryv1.ListCategoriesRequest) (*dictionaryv1.ListCategoriesResponse, error) {
+func (s *Service) ListCategories(ctx context.Context, req *dictionaryv1.ListCategoriesRequest) (*dictionaryv1.ListCategoriesResponse, error) {
 	user, err := userID(ctx)
 	if err != nil {
 		return nil, err
 	}
-	res, ok := s.cats.get(user, time.Now())
+	group, err := s.groupOf(req.GetGroup())
+	if err != nil {
+		return nil, err
+	}
+	res, ok := s.cats.get(user, group.ID, time.Now())
 	if !ok {
-		res, err = s.store.ListCategories(ctx, user)
+		res, err = s.store.ListCategories(ctx, user, group.ID)
 		if err != nil {
 			return nil, internal(ctx, "list categories", err)
 		}
-		s.cats.put(user, time.Now(), res)
+		s.cats.put(user, group.ID, time.Now(), res)
 	}
 	resp := &dictionaryv1.ListCategoriesResponse{
 		Categories: make([]*dictionaryv1.Category, 0, len(res.List)), UncategorizedTotal: int32(res.UncatTotal),
@@ -137,6 +141,10 @@ func (s *Service) UpdateWordCategories(ctx context.Context, req *dictionaryv1.Up
 		return nil, err
 	}
 	defer s.cats.forget(user)
+	group, err := s.groupOf(req.GetGroup())
+	if err != nil {
+		return nil, err
+	}
 	sys, err := s.system(ctx)
 	if err != nil {
 		return nil, err
@@ -155,7 +163,7 @@ func (s *Service) UpdateWordCategories(ctx context.Context, req *dictionaryv1.Up
 		}
 		words = append(words, n)
 	}
-	n, err := s.store.SetWordCategories(ctx, user, words, req.GetAddCategoryIds(), req.GetRemoveCategoryIds())
+	n, err := s.store.SetWordCategories(ctx, user, group.ID, words, req.GetAddCategoryIds(), req.GetRemoveCategoryIds())
 	if err != nil {
 		return nil, categoryErr(ctx, "update word categories", err)
 	}

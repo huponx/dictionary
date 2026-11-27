@@ -33,7 +33,7 @@ type fakeExports struct {
 	shownSeen    []int // built + building after every write: what the page shows
 }
 
-func (f *fakeStore) PendingPage(_ context.Context, _ string, scope store.Scope, flt store.WordFilter, afterCreated time.Time, afterWord string, limit int) ([]store.SavedWord, error) {
+func (f *fakeStore) pendingPage(_ context.Context, _ string, scope store.Scope, flt store.WordFilter, afterCreated time.Time, afterWord string, limit int) ([]store.SavedWord, error) {
 	var out []store.SavedWord
 	for _, r := range f.sorted() {
 		if !f.match(r.Word, flt) || (scope != store.ScopeAll && r.Exported) {
@@ -50,7 +50,7 @@ func (f *fakeStore) PendingPage(_ context.Context, _ string, scope store.Scope, 
 	return out, nil
 }
 
-func (f *fakeStore) CountExportable(ctx context.Context, user string, scope store.Scope, flt store.WordFilter) (int, error) {
+func (f *fakeStore) countExportable(ctx context.Context, user string, scope store.Scope, flt store.WordFilter) (int, error) {
 	w, _ := f.PendingPage(ctx, user, scope, flt, time.Time{}, "", 1<<30)
 	return len(w), nil
 }
@@ -143,7 +143,7 @@ func (f *fakeStore) AddExportPart(ctx context.Context, job store.ExportJob, leas
 		return store.ErrLeaseLost
 	}
 	f.exp.parts[j.ID] = append(f.exp.parts[j.ID], p)
-	if _, err := f.MarkExported(ctx, job.UserID, words, job.Params.Remove); err != nil {
+	if _, err := f.MarkExported(ctx, job.UserID, job.Params.Group, words, job.Params.Remove); err != nil {
 		return err
 	}
 	j.Parts++
@@ -230,7 +230,7 @@ func (d *limitDecks) Build(_ context.Context, _ string, w []anki.Word, _ bool) (
 func jobService(t *testing.T, decks Decks, words int) (*Service, *fakeStore) {
 	t.Helper()
 	st := newFakeStore()
-	s := New(fakeLooker{}, st, decks, Config{MaxSavedWords: 100000, ExportedRetentionHours: 168}).WithExports(&filestore.Store{Dir: t.TempDir()})
+	s := New(fakeLooker{}, testRegistry(), st, decks, Config{MaxSavedWords: 100000, ExportedRetentionHours: 168}).WithExports(&filestore.Store{Dir: t.TempDir()})
 	for i := range words {
 		st.rows[fmt.Sprintf("w%03d", i)] = store.SavedWord{Word: fmt.Sprintf("w%03d", i), Content: "c", CreatedAt: st.clock.Add(time.Duration(i) * time.Second)}
 	}
@@ -259,7 +259,7 @@ func runNext(t *testing.T, s *Service, st *fakeStore) {
 func TestExportJobPacksEveryWordInPartsOnce(t *testing.T) {
 	decks := &limitDecks{max: 4}
 	s, st := jobService(t, decks, 10)
-	job := startJob(t, s, &dictionaryv1.StartExportRequest{DeckName: "Big"})
+	job := startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en", DeckName: "Big"})
 	if job.Status != store.JobQueued {
 		t.Errorf("status = %s", job.Status)
 	}
@@ -292,7 +292,7 @@ func TestExportJobSplitsABatchOverTheSizeLimit(t *testing.T) {
 	// 2000 words never fit in one deck of at most 700: the batch is halved until it fits, and the smaller size is kept
 	decks := &limitDecks{max: 700}
 	s, st := jobService(t, decks, 2500)
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	runNext(t, s, st)
 	j, parts, _ := st.GetExportJob(context.Background(), "", "latest")
 	if j.Status != store.JobDone || j.Built != 2500 {
@@ -307,7 +307,7 @@ func TestExportJobSplitsABatchOverTheSizeLimit(t *testing.T) {
 
 func TestExportJobFailsOnACardThatNeverFits(t *testing.T) {
 	s, st := jobService(t, &limitDecks{max: 0}, 3)
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	runNext(t, s, st)
 	j, _, _ := st.GetExportJob(context.Background(), "", "latest")
 	if j.Status != store.JobFailed || !strings.Contains(j.Error, "too large") {
@@ -320,19 +320,19 @@ func TestExportJobFailsOnACardThatNeverFits(t *testing.T) {
 
 func TestExportJobOnePerUserAndNothingToExport(t *testing.T) {
 	s, st := jobService(t, &limitDecks{max: 10}, 3)
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
-	if _, err := s.StartExport(userCtx(), &dictionaryv1.StartExportRequest{}); code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeExportJobActive) {
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
+	if _, err := s.StartExport(userCtx(), &dictionaryv1.StartExportRequest{Group: "en"}); code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeExportJobActive) {
 		t.Errorf("second job: %v", err)
 	}
 	runNext(t, s, st)
-	if _, err := s.StartExport(userCtx(), &dictionaryv1.StartExportRequest{}); code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), CodeNoWords) {
+	if _, err := s.StartExport(userCtx(), &dictionaryv1.StartExportRequest{Group: "en"}); code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), CodeNoWords) {
 		t.Errorf("no words left: %v", err)
 	}
 }
 
 func TestExportJobCancelStopsAndKeepsTheParts(t *testing.T) {
 	s, st := jobService(t, &limitDecks{max: 2}, 6)
-	job := startJob(t, s, &dictionaryv1.StartExportRequest{})
+	job := startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	claimed, _ := st.ClaimExportJob(context.Background(), jobLease)
 	// the user cancels while the replica works: its next write finds the lease lost and nothing more is marked
 	if _, err := s.CancelExport(userCtx(), &dictionaryv1.CancelExportRequest{Id: job.Id}); err != nil {
@@ -347,14 +347,14 @@ func TestExportJobCancelStopsAndKeepsTheParts(t *testing.T) {
 	if r, err := s.CancelExport(userCtx(), &dictionaryv1.CancelExportRequest{Id: job.Id}); err != nil || r.Job.Status != store.JobCancelled {
 		t.Errorf("second cancel: %v %v", r, err)
 	}
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 }
 
 // A replica that lost the lease cannot write a part: the other replica that took the job goes on after the last part
 // recorded, with no word packed twice.
 func TestExportJobTakenOverContinuesWithoutRepeating(t *testing.T) {
 	s, st := jobService(t, &limitDecks{max: 2}, 6)
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	first, _ := st.ClaimExportJob(context.Background(), jobLease)
 	// the first replica packs one part, then dies
 	words, _ := st.PendingPage(context.Background(), userUUID, store.ScopeNew, store.WordFilter{}, time.Time{}, "", 2)
@@ -383,7 +383,7 @@ func TestExportJobTakenOverContinuesWithoutRepeating(t *testing.T) {
 
 func TestExportPartLinkWorksManyTimesUntilExpiry(t *testing.T) {
 	s, st := jobService(t, &limitDecks{max: 3}, 5)
-	job := startJob(t, s, &dictionaryv1.StartExportRequest{DeckName: "D"})
+	job := startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en", DeckName: "D"})
 	runNext(t, s, st)
 	if _, err := s.CreateExportPartLink(userCtx(), &dictionaryv1.CreateExportPartLinkRequest{Id: job.Id, N: 9}); code(err) != codes.NotFound {
 		t.Errorf("unknown part: %v", err)
@@ -422,7 +422,7 @@ func TestExportPartLinkWorksManyTimesUntilExpiry(t *testing.T) {
 func TestSweepExportFilesDeletesWhatNoPartRecords(t *testing.T) {
 	ctx := context.Background()
 	s, st := jobService(t, &limitDecks{max: 3}, 5)
-	startJob(t, s, &dictionaryv1.StartExportRequest{DeckName: "D"})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en", DeckName: "D"})
 	runNext(t, s, st)
 	var recorded string
 	for _, ps := range st.exp.parts {
@@ -459,20 +459,20 @@ func TestSweepExportFilesDeletesWhatNoPartRecords(t *testing.T) {
 		t.Errorf("a young file (a part being written) was deleted: %v", err)
 	}
 	// without a directory there is nothing to sweep
-	if n, err := New(fakeLooker{}, st, &fakeDecks{}, Config{}).SweepExportFiles(ctx, time.Hour, 10); err != nil || n != 0 {
+	if n, err := New(fakeLooker{}, testRegistry(), st, &fakeDecks{}, Config{}).SweepExportFiles(ctx, time.Hour, 10); err != nil || n != 0 {
 		t.Errorf("no volume: %d %v", n, err)
 	}
 }
 
 func TestExportJobsDisabledWithoutADirectory(t *testing.T) {
 	st := newFakeStore()
-	s := New(fakeLooker{}, st, &fakeDecks{}, Config{MaxSavedWords: 10})
-	if _, err := s.StartExport(userCtx(), &dictionaryv1.StartExportRequest{}); code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeExportJobsDisabled) {
+	s := New(fakeLooker{}, testRegistry(), st, &fakeDecks{}, Config{MaxSavedWords: 10})
+	if _, err := s.StartExport(userCtx(), &dictionaryv1.StartExportRequest{Group: "en"}); code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeExportJobsDisabled) {
 		t.Errorf("disabled: %v", err)
 	}
 }
 
-func (f *fakeStore) SavedByNames(_ context.Context, _ string, words []string) (map[string][]string, error) {
+func (f *fakeStore) savedByNames(_ context.Context, _ string, words []string) (map[string][]string, error) {
 	out := map[string][]string{}
 	for _, w := range words {
 		if _, ok := f.rows[w]; ok {
@@ -503,7 +503,7 @@ func TestExportJobReportsProgressInsideAPartAndResetsItBetweenParts(t *testing.T
 	defer func() { buildingEvery = old }()
 	decks := &progressDecks{limitDecks{max: 100}}
 	s, st := jobService(t, decks, 10)
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	runNext(t, s, st)
 	j, _, _ := st.GetExportJob(context.Background(), "", "latest")
 	if j.Status != store.JobDone || j.Built != 10 || j.Building != 0 {
@@ -529,7 +529,7 @@ func TestExportJobProgressNeverGoesDownWhenABatchIsTooLarge(t *testing.T) {
 	defer func() { buildingEvery = old }()
 	decks := &progressDecks{limitDecks{max: 4}} // the batch of 10 words is refused after it reported 9 done
 	s, st := jobService(t, decks, 10)
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	runNext(t, s, st)
 	j, _, _ := st.GetExportJob(context.Background(), "", "latest")
 	if j.Status != store.JobDone || j.Built != 10 || j.Building != 0 {
@@ -548,7 +548,7 @@ func TestExportJobProgressNeverGoesDownWhenABatchIsTooLarge(t *testing.T) {
 
 func TestBuildingReporterOnlyGrowsAndIsThrottled(t *testing.T) {
 	st := newFakeStore()
-	s := New(fakeLooker{}, st, &fakeDecks{}, Config{MaxSavedWords: 10})
+	s := New(fakeLooker{}, testRegistry(), st, &fakeDecks{}, Config{MaxSavedWords: 10})
 	st.exp.jobs = map[string]*store.ExportJob{"j": {ID: "j", Status: store.JobRunning, LeaseID: "l"}}
 	old := buildingEvery
 	buildingEvery = time.Hour // after the first write nothing is written for an hour
@@ -606,7 +606,7 @@ func TestDownloadExportPartStreamsALargeFileInChunks(t *testing.T) {
 	for i := range big {
 		big[i] = byte(i * 7)
 	}
-	job := startJob(t, s, &dictionaryv1.StartExportRequest{DeckName: "Big"})
+	job := startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en", DeckName: "Big"})
 	runNext(t, s, st)
 	_, parts, _ := st.GetExportJob(context.Background(), "", job.Id)
 	if err := s.exports.Write(userUUID, parts[0].FileID, "apkg", big); err != nil {
@@ -641,7 +641,7 @@ func realJobService(t *testing.T, words int, content string, cfg Config) (*Servi
 	t.Helper()
 	st := newFakeStore()
 	cfg.MaxSavedWords, cfg.ExportedRetentionHours = 100000, 168
-	s := New(fakeLooker{}, st, &anki.Builder{}, cfg).WithExports(&filestore.Store{Dir: t.TempDir()})
+	s := New(fakeLooker{}, testRegistry(), st, &anki.Builder{}, cfg).WithExports(&filestore.Store{Dir: t.TempDir()})
 	for i := range words {
 		c := content
 		if len(c) > 8 { // random text of that length: the zip cannot squeeze it away
@@ -665,7 +665,7 @@ func putExportLimit(st *fakeStore, key string, n int) {
 
 func TestExportJobBatchGrowsWhileThePartsStayUnderHalfTheLimit(t *testing.T) {
 	s, st := realJobService(t, 5000, "c", Config{ExportPartMaxBytes: 8 << 20, ExportPartMaxBytesCeiling: 8 << 20})
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	runNext(t, s, st)
 	j, parts, _ := st.GetExportJob(context.Background(), "", "latest")
 	if j.Status != store.JobDone || j.Built != 5000 {
@@ -678,7 +678,7 @@ func TestExportJobBatchGrowsWhileThePartsStayUnderHalfTheLimit(t *testing.T) {
 
 func TestExportJobBatchStopsAtTheConfiguredMaximum(t *testing.T) {
 	s, st := realJobService(t, 5000, "c", Config{ExportPartMaxBytes: 8 << 20, ExportPartMaxBytesCeiling: 8 << 20, ExportJobBatchMax: jobBatch})
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	runNext(t, s, st)
 	if _, parts, _ := st.GetExportJob(context.Background(), "", "latest"); len(parts) != 3 {
 		t.Errorf("%d parts, want 3 of at most %d words", len(parts), jobBatch)
@@ -688,7 +688,7 @@ func TestExportJobBatchStopsAtTheConfiguredMaximum(t *testing.T) {
 func TestExportJobReadsThePartLimitOfTheSettingForEveryBatch(t *testing.T) {
 	// 64 KiB parts of 2 KiB cards: dozens of words per part, never one batch of 2000
 	s, st := realJobService(t, 400, strings.Repeat("x", 2000), Config{ExportPartMaxBytes: 64 << 10, ExportPartMaxBytesCeiling: 1 << 20})
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	runNext(t, s, st)
 	j, parts, _ := st.GetExportJob(context.Background(), "", "latest")
 	if j.Status != store.JobDone || j.Built != 400 {
@@ -704,7 +704,7 @@ func TestExportJobReadsThePartLimitOfTheSettingForEveryBatch(t *testing.T) {
 	// the administrator raises the limit while a job runs: the next batch is packed under the new one
 	s2, st2 := realJobService(t, 400, strings.Repeat("x", 2000), Config{ExportPartMaxBytes: 64 << 10, ExportPartMaxBytesCeiling: 1 << 20})
 	putExportLimit(st2, "export_part_max_bytes", 1<<20)
-	startJob(t, s2, &dictionaryv1.StartExportRequest{})
+	startJob(t, s2, &dictionaryv1.StartExportRequest{Group: "en"})
 	runNext(t, s2, st2)
 	if _, parts, _ := st2.GetExportJob(context.Background(), "", "latest"); len(parts) >= small || len(parts) < 1 {
 		t.Errorf("a larger limit gave %d parts, the small one %d", len(parts), small)
@@ -714,12 +714,12 @@ func TestExportJobReadsThePartLimitOfTheSettingForEveryBatch(t *testing.T) {
 func TestBuildDeckUsesTheExportSizeOfTheSetting(t *testing.T) {
 	s, st := realJobService(t, 100, strings.Repeat("y", 2000), Config{ExportMaxBytes: 4 << 20, ExportMaxBytesCeiling: 4 << 20})
 	putExportLimit(st, "export_max_bytes", 64<<10)
-	_, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{})
+	_, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"})
 	if code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeExportTooBig) {
 		t.Fatalf("a deck over the setting: %v", err)
 	}
 	putExportLimit(st, "export_max_bytes", 4<<20)
-	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{}); err != nil {
+	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"}); err != nil {
 		t.Errorf("the same deck under the raised setting: %v", err)
 	}
 }
@@ -727,11 +727,11 @@ func TestBuildDeckUsesTheExportSizeOfTheSetting(t *testing.T) {
 // dictionary-worker builds the service without a looker: a job never looks a word up.
 func TestExportJobRunsWithoutALooker(t *testing.T) {
 	st := newFakeStore()
-	s := New(nil, st, &fakeDecks{}, Config{MaxSavedWords: 100000, ExportedRetentionHours: 168}).WithExports(&filestore.Store{Dir: t.TempDir()})
+	s := New(nil, testRegistry(), st, &fakeDecks{}, Config{MaxSavedWords: 100000, ExportedRetentionHours: 168}).WithExports(&filestore.Store{Dir: t.TempDir()})
 	for i := range 3 {
 		st.rows[fmt.Sprintf("w%03d", i)] = store.SavedWord{Word: fmt.Sprintf("w%03d", i), Content: "c", CreatedAt: st.clock.Add(time.Duration(i) * time.Second)}
 	}
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	runNext(t, s, st)
 	j, parts, err := st.GetExportJob(context.Background(), "", "latest")
 	if err != nil || j.Status != store.JobDone || j.Built != 3 || len(parts) != 1 {
@@ -768,7 +768,7 @@ func TestExportJobBatchIsSizedFromTheBytesPerWordOfThePart(t *testing.T) {
 	decks := &weightDecks{max: 300_000, heavy: func(int) int { return 100 }}
 	s, st := jobService(t, decks, 7000)
 	putExportLimit(st, "export_part_max_bytes", 300_000)
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	runNext(t, s, st)
 	j, parts, _ := st.GetExportJob(context.Background(), "", "latest")
 	if j.Status != store.JobDone || j.Built != 7000 {
@@ -790,7 +790,7 @@ func TestExportJobBatchShrinksWhenTheWordsGetHeavier(t *testing.T) {
 	}}
 	s, st := jobService(t, decks, 5000)
 	putExportLimit(st, "export_part_max_bytes", 300_000)
-	startJob(t, s, &dictionaryv1.StartExportRequest{})
+	startJob(t, s, &dictionaryv1.StartExportRequest{Group: "en"})
 	runNext(t, s, st)
 	j, _, _ := st.GetExportJob(context.Background(), "", "latest")
 	if j.Status != store.JobDone || j.Built != 5000 {

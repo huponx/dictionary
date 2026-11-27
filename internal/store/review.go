@@ -12,6 +12,7 @@ import (
 // ReviewCard is a word of the list to review. A word without a row in dictionary_review_state is new (IsNew,
 // State is srs.New()).
 type ReviewCard struct {
+	Group   string
 	Word    string
 	Content string
 	AudioUK string
@@ -42,7 +43,7 @@ const reviewCountCap = 10000
 func (s *Store) ReviewQueue(ctx context.Context, userID string, now time.Time, f WordFilter, limit, dueAllowed, newAllowed int) ([]ReviewCard, error) {
 	args := []any{userID, now, min(limit, dueAllowed)}
 	rows, err := s.pool.Query(ctx, `
-		SELECT w.word, w.content, w.audio_uk, w.audio_us, r.ease, r.interval_days, r.reps, r.lapses, r.learning, r.due_at,
+		SELECT w.grp, w.word, w.content, w.audio_uk, w.audio_us, r.ease, r.interval_days, r.reps, r.lapses, r.learning, r.due_at,
 		       r.stability, r.difficulty, r.last_reviewed_at
 		FROM dictionary_review_state r JOIN dictionary_saved_words w ON w.user_id = r.user_id AND w.word = r.word
 		WHERE r.user_id = $1 AND r.due_at <= $2 AND w.removed_at IS NULL`+f.clause("w", &args)+`
@@ -55,7 +56,7 @@ func (s *Store) ReviewQueue(ctx context.Context, userID string, now time.Time, f
 	for rows.Next() {
 		var c ReviewCard
 		var ease, stability, difficulty float32
-		if err := rows.Scan(&c.Word, &c.Content, &c.AudioUK, &c.AudioUS, &ease, &c.State.IntervalDays, &c.State.Reps,
+		if err := rows.Scan(&c.Group, &c.Word, &c.Content, &c.AudioUK, &c.AudioUS, &ease, &c.State.IntervalDays, &c.State.Reps,
 			&c.State.Lapses, &c.State.Learning, &c.State.Due, &stability, &difficulty, &c.State.Last); err != nil {
 			return nil, err
 		}
@@ -71,8 +72,8 @@ func (s *Store) ReviewQueue(ctx context.Context, userID string, now time.Time, f
 	if n := min(limit-len(out), newAllowed); n > 0 {
 		args := []any{userID, n}
 		fresh, err := s.pool.Query(ctx, `
-			SELECT w.word, w.content, w.audio_uk, w.audio_us
-			FROM dictionary_saved_words w
+			SELECT w.grp, w.word, w.content, w.audio_uk, w.audio_us
+				FROM dictionary_saved_words w
 			WHERE w.user_id = $1 AND w.removed_at IS NULL AND NOT w.review_started`+f.clause("w", &args)+`
 			ORDER BY w.created_at, w.word LIMIT $2`, args...)
 		if err != nil {
@@ -81,7 +82,7 @@ func (s *Store) ReviewQueue(ctx context.Context, userID string, now time.Time, f
 		defer fresh.Close()
 		for fresh.Next() {
 			c := ReviewCard{IsNew: true, State: srs.New()}
-			if err := fresh.Scan(&c.Word, &c.Content, &c.AudioUK, &c.AudioUS); err != nil {
+			if err := fresh.Scan(&c.Group, &c.Word, &c.Content, &c.AudioUK, &c.AudioUS); err != nil {
 				return nil, err
 			}
 			out = append(out, c)
@@ -119,8 +120,8 @@ func (s *Store) ReviewCounts(ctx context.Context, userID string, now time.Time, 
 		  (SELECT count(*) FROM (SELECT 1 FROM dictionary_saved_words w WHERE w.user_id = $1 AND w.removed_at IS NULL AND NOT w.review_started`+cl+` LIMIT $3) t),
 		  `+due("NOT r.learning")+`,
 		  `+due("r.learning")+`,
-		  (SELECT r.due_at FROM dictionary_review_state r JOIN dictionary_saved_words w ON w.user_id = r.user_id AND w.word = r.word
-			WHERE r.user_id = $1 AND r.due_at > $2 AND w.removed_at IS NULL`+cl+` ORDER BY r.due_at LIMIT 1)`, args...).
+		  (SELECT r.due_at FROM dictionary_review_state r JOIN dictionary_saved_words w ON w.user_id = r.user_id AND w.grp = r.grp AND w.word = r.word
+				WHERE r.user_id = $1 AND r.due_at > $2 AND w.removed_at IS NULL`+cl+` ORDER BY r.due_at LIMIT 1)`, args...).
 		Scan(&c.Total, &c.New, &c.Due, &c.Learning, &next)
 	if next != nil {
 		c.Next = *next
@@ -133,13 +134,13 @@ func (s *Store) ReviewCounts(ctx context.Context, userID string, now time.Time, 
 // (newWords), and how many cards of the list that were reviewed before were reviewed again in that time (again).
 // Only the last review of a card is stored, so a card reviewed several times counts once. One range scan on the
 // reviews of the last 24 hours.
-func (s *Store) ReviewToday(ctx context.Context, userID string, now time.Time) (newWords, again int, err error) {
+func (s *Store) ReviewToday(ctx context.Context, userID, group string, now time.Time) (newWords, again int, err error) {
 	since := now.Add(-24 * time.Hour)
 	err = s.pool.QueryRow(ctx, `
 		SELECT count(*) FILTER (WHERE r.first_reviewed_at > $2), count(*) FILTER (WHERE r.first_reviewed_at <= $2)
 		FROM dictionary_review_state r
-		JOIN dictionary_saved_words w ON w.user_id = r.user_id AND w.word = r.word AND w.removed_at IS NULL
-		WHERE r.user_id = $1 AND r.last_reviewed_at > $2`, userID, since).Scan(&newWords, &again)
+		JOIN dictionary_saved_words w ON w.user_id = r.user_id AND w.grp = r.grp AND w.word = r.word AND w.removed_at IS NULL
+			WHERE r.user_id = $1 AND r.grp = $3 AND r.last_reviewed_at > $2`, userID, since, group).Scan(&newWords, &again)
 	return newWords, again, mapErr(err)
 }
 
@@ -183,7 +184,7 @@ func (s *Store) AddReviewBonus(ctx context.Context, userID string, now time.Time
 // PutReview applies next to the schedule of the word, stores the result and logs the grade. It runs in a
 // transaction that locks the word and the schedule, so two grades of one card apply one after the other. ErrNotFound
 // when the word is not in the list of the user.
-func (s *Store) PutReview(ctx context.Context, userID, word string, now time.Time, grade srs.Grade, next func(srs.State) srs.State) (srs.State, error) {
+func (s *Store) PutReview(ctx context.Context, userID, group, word string, now time.Time, grade srs.Grade, next func(srs.State) srs.State) (srs.State, error) {
 	var out srs.State
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		// no row to lock for a new word: serialize the grades of one user instead (the same lock as SaveWord)
@@ -192,15 +193,15 @@ func (s *Store) PutReview(ctx context.Context, userID, word string, now time.Tim
 		}
 		// FOR SHARE keeps a delete of the word from slipping in between the read and the write
 		var listed bool
-		err := tx.QueryRow(ctx, `SELECT true FROM dictionary_saved_words WHERE user_id = $1 AND word = $2 AND removed_at IS NULL FOR SHARE`,
-			userID, word).Scan(&listed)
+		err := tx.QueryRow(ctx, `SELECT true FROM dictionary_saved_words WHERE user_id = $1 AND grp = $3 AND word = $2 AND removed_at IS NULL FOR SHARE`,
+			userID, word, group).Scan(&listed)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
 		if err != nil {
 			return err
 		}
-		cur, first, err := reviewState(ctx, tx, userID, word, now)
+		cur, first, err := reviewState(ctx, tx, userID, group, word, now)
 		if err != nil {
 			return err
 		}
@@ -212,18 +213,18 @@ func (s *Store) PutReview(ctx context.Context, userID, word string, now time.Tim
 		out.Last = now
 		var b pgx.Batch
 		b.Queue(`
-			INSERT INTO dictionary_review_state (user_id, word, ease, interval_days, reps, lapses, learning, due_at, first_reviewed_at,
+			INSERT INTO dictionary_review_state (user_id, grp, word, ease, interval_days, reps, lapses, learning, due_at, first_reviewed_at,
 				last_reviewed_at, stability, difficulty)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-			ON CONFLICT (user_id, word) DO UPDATE SET ease = EXCLUDED.ease, interval_days = EXCLUDED.interval_days,
+			VALUES ($1, $13, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			ON CONFLICT (user_id, grp, word) DO UPDATE SET ease = EXCLUDED.ease, interval_days = EXCLUDED.interval_days,
 				reps = EXCLUDED.reps, lapses = EXCLUDED.lapses, learning = EXCLUDED.learning, due_at = EXCLUDED.due_at,
 				last_reviewed_at = EXCLUDED.last_reviewed_at, stability = EXCLUDED.stability, difficulty = EXCLUDED.difficulty`,
 			userID, word, float32(out.Ease), out.IntervalDays, out.Reps, out.Lapses, out.Learning, out.Due, first, now,
-			float32(out.Stability), float32(out.Difficulty))
+			float32(out.Stability), float32(out.Difficulty), group)
 		// the word is no longer new (the partial index of the new words skips it)
-		b.Queue(`UPDATE dictionary_saved_words SET review_started = true WHERE user_id = $1 AND word = $2 AND NOT review_started`, userID, word)
-		b.Queue(`INSERT INTO dictionary_review_log (user_id, word, reviewed_at, grade, elapsed_seconds, was_learning)
-			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`, userID, word, now, int16(grade), elapsed, cur.Learning)
+		b.Queue(`UPDATE dictionary_saved_words SET review_started = true WHERE user_id = $1 AND grp = $3 AND word = $2 AND NOT review_started`, userID, word, group)
+		b.Queue(`INSERT INTO dictionary_review_log (user_id, grp, word, reviewed_at, grade, elapsed_seconds, was_learning)
+				VALUES ($1, $7, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`, userID, word, now, int16(grade), elapsed, cur.Learning, group)
 		res := tx.SendBatch(ctx, &b)
 		for i := 0; i < b.Len(); i++ {
 			if _, err := res.Exec(); err != nil {
@@ -240,11 +241,11 @@ func (s *Store) PutReview(ctx context.Context, userID, word string, now time.Tim
 }
 
 // reviewState reads the schedule of the word with a lock; a word without one is new (first is now).
-func reviewState(ctx context.Context, tx pgx.Tx, userID, word string, now time.Time) (srs.State, time.Time, error) {
+func reviewState(ctx context.Context, tx pgx.Tx, userID, group, word string, now time.Time) (srs.State, time.Time, error) {
 	s, first := srs.New(), now
 	var ease, stability, difficulty float32
 	err := tx.QueryRow(ctx, `SELECT ease, interval_days, reps, lapses, learning, due_at, first_reviewed_at, stability, difficulty, last_reviewed_at
-		FROM dictionary_review_state WHERE user_id = $1 AND word = $2 FOR UPDATE`, userID, word).
+		FROM dictionary_review_state WHERE user_id = $1 AND grp = $3 AND word = $2 FOR UPDATE`, userID, word, group).
 		Scan(&ease, &s.IntervalDays, &s.Reps, &s.Lapses, &s.Learning, &s.Due, &first, &stability, &difficulty, &s.Last)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return srs.New(), now, nil
@@ -260,9 +261,9 @@ type reviewRow struct {
 }
 
 // reviewStates returns the review state of the words that were reviewed; a new word has no entry.
-func (s *Store) reviewStates(ctx context.Context, userID string, words []string) (map[string]reviewRow, error) {
+func (s *Store) reviewStates(ctx context.Context, userID, group string, words []string) (map[string]reviewRow, error) {
 	rows, err := s.pool.Query(ctx, `SELECT word, due_at, learning FROM dictionary_review_state
-		WHERE user_id = $1 AND word = ANY($2)`, userID, words)
+		WHERE user_id = $1 AND grp = $3 AND word = ANY($2)`, userID, words, group)
 	if err != nil {
 		return nil, mapErr(err)
 	}

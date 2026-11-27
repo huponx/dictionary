@@ -12,7 +12,7 @@ import (
 func saveWords(t *testing.T, s *Service, words ...string) {
 	t.Helper()
 	for _, w := range words {
-		if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: w, Content: w}); err != nil {
+		if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: w, Content: w}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -40,13 +40,13 @@ func TestExportRemovesOnlyWhenSystemAndUserAllow(t *testing.T) {
 				st.settings = map[string]json.RawMessage{"remove_after_export": json.RawMessage(`false`)}
 			}
 			saveWords(t, s, "one", "two")
-			if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{}); err != nil {
+			if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"}); err != nil {
 				t.Fatal(err)
 			}
 			if st.lastRemove != c.wantRemove {
 				t.Errorf("remove = %v, want %v", st.lastRemove, c.wantRemove)
 			}
-			r, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{})
+			r, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en"})
 			wantTotal, wantNew := int32(0), int32(0)
 			if !c.wantRemove {
 				wantTotal = 2
@@ -68,31 +68,31 @@ func TestExportScope(t *testing.T) {
 	decks := &fakeDecks{}
 	s := newService(st, decks).WithPrefs(&fakePrefs{raw: `{"removeAfterExport":false}`})
 	saveWords(t, s, "one", "two")
-	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{}); err != nil {
+	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"}); err != nil {
 		t.Fatal(err)
 	}
 	saveWords(t, s, "three")
 
 	// new only (also the default): just "three"
-	r, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Scope: dictionaryv1.ExportScope_EXPORT_SCOPE_NEW})
+	r, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en", Scope: dictionaryv1.ExportScope_EXPORT_SCOPE_NEW})
 	if err != nil || r.WordCount != 1 {
 		t.Fatalf("new: %+v %v", r, err)
 	}
 	// nothing new now: the usual error, even though the list is not empty
-	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{}); code(err) != codes.InvalidArgument {
+	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"}); code(err) != codes.InvalidArgument {
 		t.Errorf("no new words: %v", err)
 	}
 	// all: the three words
-	r, err = s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Scope: dictionaryv1.ExportScope_EXPORT_SCOPE_ALL})
+	r, err = s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en", Scope: dictionaryv1.ExportScope_EXPORT_SCOPE_ALL})
 	if err != nil || r.WordCount != 3 {
 		t.Fatalf("all: %+v %v", r, err)
 	}
 	// the same for a link
-	l, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{Scope: dictionaryv1.ExportScope_EXPORT_SCOPE_ALL})
+	l, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{Group: "en", Scope: dictionaryv1.ExportScope_EXPORT_SCOPE_ALL})
 	if err != nil || l.WordCount != 3 {
 		t.Fatalf("link all: %+v %v", l, err)
 	}
-	if _, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{}); code(err) != codes.InvalidArgument {
+	if _, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{Group: "en"}); code(err) != codes.InvalidArgument {
 		t.Errorf("link, no new words: %v", err)
 	}
 }
@@ -101,18 +101,18 @@ func TestRemoveExportedWords(t *testing.T) {
 	st := newFakeStore()
 	s := newService(st, &fakeDecks{}).WithPrefs(&fakePrefs{raw: `{"removeAfterExport":false}`})
 	saveWords(t, s, "one", "two")
-	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{}); err != nil {
+	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"}); err != nil {
 		t.Fatal(err)
 	}
 	saveWords(t, s, "three")
-	r, err := s.RemoveExportedWords(userCtx(), &dictionaryv1.RemoveExportedWordsRequest{})
+	r, err := s.RemoveExportedWords(userCtx(), &dictionaryv1.RemoveExportedWordsRequest{Group: "en"})
 	if err != nil || r.Removed != 2 {
 		t.Fatalf("%+v %v", r, err)
 	}
-	if l, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{}); l.Total != 1 || l.NewTotal != 1 {
+	if l, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en"}); l.Total != 1 || l.NewTotal != 1 {
 		t.Errorf("the new word stays: %+v", l)
 	}
-	if _, err := s.RemoveExportedWords(context.Background(), &dictionaryv1.RemoveExportedWordsRequest{}); code(err) != codes.Unauthenticated {
+	if _, err := s.RemoveExportedWords(context.Background(), &dictionaryv1.RemoveExportedWordsRequest{Group: "en"}); code(err) != codes.Unauthenticated {
 		t.Errorf("needs a user: %v", err)
 	}
 }
@@ -139,7 +139,7 @@ func TestRemoveSettingsRoundTrip(t *testing.T) {
 	}
 	// the choice of the user survives the system being off, so turning the system on again restores it
 	u := &dictionaryv1.UserSettings{
-		EnglishEnabled: true, EnglishViEnabled: true, MaxLookupWords: 5, RemoveAfterExport: true, RemoveAcknowledged: true,
+		MaxLookupWords: 5, RemoveAfterExport: true, RemoveAcknowledged: true,
 	}
 	if _, err := s.UpdateMySettings(userCtx(), &dictionaryv1.UpdateMySettingsRequest{User: u}); err != nil {
 		t.Fatal(err)
