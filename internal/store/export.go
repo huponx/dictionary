@@ -30,6 +30,8 @@ const (
 // ExportParams is what a job exports and how, fixed when it starts. The preferences of the user (fresh, remove)
 // are read at the start because the worker has no request to read them with.
 type ExportParams struct {
+	// Group of the words the job packs.
+	Group         string `json:"group"`
 	All           bool   `json:"all"` // scope: every word of the list, the exported ones too
 	CategoryID    string `json:"categoryId,omitempty"`
 	Uncategorized bool   `json:"uncategorized,omitempty"`
@@ -41,9 +43,9 @@ type ExportParams struct {
 	AfterWord    string    `json:"afterWord"`
 }
 
-// Filter is the category filter of the job.
+// Filter is the group and the category filter of the job.
 func (p ExportParams) Filter() WordFilter {
-	return WordFilter{CategoryID: p.CategoryID, Uncategorized: p.Uncategorized}
+	return WordFilter{Group: p.Group, CategoryID: p.CategoryID, Uncategorized: p.Uncategorized}
 }
 
 // Scope is the scope of the job.
@@ -103,7 +105,7 @@ func scanJob(row pgx.Row) (ExportJob, error) {
 func (s *Store) PendingPage(ctx context.Context, userID string, scope Scope, f WordFilter, afterCreated time.Time, afterWord string, limit int) ([]SavedWord, error) {
 	args := []any{userID}
 	src := f.source(&args)
-	q := `SELECT w.word, w.content, w.audio_uk, w.audio_us, w.created_at, w.exported_at IS NOT NULL FROM ` + src.from + ` WHERE ` + src.where
+	q := `SELECT w.grp, w.word, w.content, w.audio_uk, w.audio_us, w.created_at, w.exported_at IS NOT NULL FROM ` + src.from + ` WHERE ` + src.where
 	if scope != ScopeAll {
 		q += ` AND w.exported_at IS NULL`
 	}
@@ -279,7 +281,7 @@ func (s *Store) AddExportPart(ctx context.Context, job ExportJob, leaseID string
 		}
 		n, bytes, err := changedRows(ctx, tx, `UPDATE dictionary_saved_words
 			SET exported_at = now(), removed_at = CASE WHEN $3 THEN now() END
-			WHERE user_id = $1 AND removed_at IS NULL AND word = ANY($2)`, job.UserID, words, job.Params.Remove)
+			WHERE user_id = $1 AND grp = $4 AND removed_at IS NULL AND word = ANY($2)`, job.UserID, words, job.Params.Remove, job.Params.Group)
 		if err != nil {
 			return err
 		}

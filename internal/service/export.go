@@ -54,7 +54,7 @@ func (s *Service) WithExports(files *filestore.Store) *Service {
 
 func toProtoJob(j store.ExportJob, parts []store.ExportPart) *dictionaryv1.ExportJob {
 	out := &dictionaryv1.ExportJob{
-		Id: j.ID, Status: j.Status, DeckName: j.Params.DeckName, Total: int32(j.Total), Built: int32(j.Built), Building: int32(j.Building), Error: j.Error,
+		Id: j.ID, Status: j.Status, DeckName: j.Params.DeckName, Group: j.Params.Group, Total: int32(j.Total), Built: int32(j.Built), Building: int32(j.Building), Error: j.Error,
 		CreatedAt: j.CreatedAt.UTC().Format(time.RFC3339), ExpiresAt: j.ExpiresAt.UTC().Format(time.RFC3339),
 	}
 	if !j.FinishedAt.IsZero() {
@@ -95,7 +95,10 @@ func (s *Service) StartExport(ctx context.Context, req *dictionaryv1.StartExport
 	if err != nil {
 		return nil, err
 	}
-	filter := wordFilter(req.GetCategoryId(), req.GetUncategorized())
+	filter, err := s.wordFilter(req.GetGroup(), req.GetCategoryId(), req.GetUncategorized())
+	if err != nil {
+		return nil, err
+	}
 	if filter.CategoryID != "" {
 		catName, err := s.store.CategoryName(ctx, user, filter.CategoryID)
 		if errors.Is(err, store.ErrNotFound) {
@@ -115,7 +118,7 @@ func (s *Service) StartExport(ctx context.Context, req *dictionaryv1.StartExport
 		return nil, apperror.InvalidArgument(CodeNoWords + ": no saved words to export").WithReason("no_words_to_export")
 	}
 	p := store.ExportParams{
-		All: scope == store.ScopeAll, CategoryID: filter.CategoryID, Uncategorized: filter.Uncategorized, DeckName: name,
+		Group: filter.Group, All: scope == store.ScopeAll, CategoryID: filter.CategoryID, Uncategorized: filter.Uncategorized, DeckName: name,
 		Fresh: s.userPrefs(ctx).FreshDeck, Remove: s.removesAfterExport(ctx, sys),
 	}
 	j, err := s.store.CreateExportJob(ctx, user, p, s.cfg.ExportJobTTL)

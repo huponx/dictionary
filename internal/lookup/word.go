@@ -9,14 +9,6 @@ import (
 	"unicode/utf8"
 )
 
-// Dictionary identifies the source of a lookup.
-type Dictionary string
-
-const (
-	English           Dictionary = "english"
-	EnglishVietnamese Dictionary = "english-vietnamese"
-)
-
 var (
 	// ErrNotFound: no provider has an entry for the word.
 	ErrNotFound = errors.New("lookup: word not found")

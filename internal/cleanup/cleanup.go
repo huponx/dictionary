@@ -70,20 +70,21 @@ func retention(ctx context.Context, st *store.Store, cfg Config, log *zap.Logger
 	return time.Duration(settings.FromRows(rows, def).ExportedRetentionHours) * time.Hour
 }
 
-// reconcileBatch is the number of users whose counter of listed words is recomputed per cleanup tick.
+// reconcileBatch is the number of users whose counters are recomputed per cleanup tick.
 const reconcileBatch = 50
 
-// reconcileListed recomputes the counters of one batch of users and logs the ones that were wrong. It returns the
+// reconcileCounters recomputes the counters of one batch of users and logs the ones that were wrong. It returns the
 // cursor for the next call.
-func reconcileListed(ctx context.Context, st *store.Store, after string, log *zap.Logger) string {
-	next, fixed, err := st.ReconcileListed(ctx, after, reconcileBatch)
+func reconcileCounters(ctx context.Context, st *store.Store, after string, log *zap.Logger) string {
+	next, fixed, err := st.ReconcileCounters(ctx, after, reconcileBatch)
 	if err != nil {
 		log.Warn("reconcile listed counters", zap.Error(err))
 		return after
 	}
 	for u, was := range fixed {
-		log.Warn("listed or content counter was wrong and is fixed", zap.String("user", u),
-			zap.Int64("listed was", was.Listed), zap.Int64("content bytes was", was.ContentBytes))
+		log.Warn("counter was wrong and is fixed", zap.String("user", u),
+			zap.Int64("listed was", was.Listed), zap.Int64("content bytes was", was.ContentBytes),
+			zap.Int64("image bytes was", was.ImageBytes), zap.Int64("audio bytes was", was.AudioBytes))
 	}
 	return next
 }
@@ -120,7 +121,7 @@ func (c *Cleaner) Run(ctx context.Context) {
 			}
 			c.PurgeDeleted(ctx)
 			cleanReviewLog(ctx, st, log)
-			reconcileAfter = reconcileListed(ctx, st, reconcileAfter, log)
+			reconcileAfter = reconcileCounters(ctx, st, reconcileAfter, log)
 			sweepDue := time.Since(lastSweep) >= cfg.OrphanSweepEvery
 			if sweepDue {
 				lastSweep = time.Now()

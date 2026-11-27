@@ -279,29 +279,29 @@ func TestVietnamese(t *testing.T) {
 
 func TestServiceCacheAndMany(t *testing.T) {
 	p := &fakeProvider{word: &Word{Text: "x"}}
-	s := New(map[Dictionary]Provider{English: p}, time.Hour, 10)
+	s := New(NewRegistry().Register(Entry{ID: "english", Group: "en", Provider: p}), time.Hour, 10)
 	for range 3 {
-		if _, err := s.Lookup(context.Background(), English, " Hello "); err != nil {
+		if _, err := s.Lookup(context.Background(), "english", " Hello "); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if p.calls.Load() != 1 {
 		t.Errorf("provider calls = %d, want 1 (cached)", p.calls.Load())
 	}
-	if _, err := s.Lookup(context.Background(), EnglishVietnamese, "x"); err == nil {
-		t.Error("unknown dictionary must fail")
+	if _, err := s.Lookup(context.Background(), "english-vietnamese", "x"); !errors.Is(err, ErrUnknownDictionary) {
+		t.Errorf("unknown dictionary: %v", err)
 	}
-	if _, err := s.Lookup(context.Background(), English, "a/b"); !errors.Is(err, ErrInvalidWord) {
+	if _, err := s.Lookup(context.Background(), "english", "a/b"); !errors.Is(err, ErrInvalidWord) {
 		t.Errorf("invalid word: %v", err)
 	}
 
 	multi := &multiProvider{}
-	s2 := New(map[Dictionary]Provider{English: multi}, 0, 0)
-	found, nf, err := s2.LookupMany(context.Background(), English, []string{"a", "A", "missing", "b"})
+	s2 := New(NewRegistry().Register(Entry{ID: "english", Group: "en", Provider: multi}), 0, 0)
+	found, nf, err := s2.LookupMany(context.Background(), "english", []string{"a", "A", "missing", "b"})
 	if err != nil || len(found) != 2 || len(nf) != 1 || nf[0] != "missing" {
 		t.Fatalf("found=%v notFound=%v err=%v", found, nf, err)
 	}
-	if _, _, err := s2.LookupMany(context.Background(), English, []string{"a", "boom"}); !errors.Is(err, ErrUnavailable) {
+	if _, _, err := s2.LookupMany(context.Background(), "english", []string{"a", "boom"}); !errors.Is(err, ErrUnavailable) {
 		t.Errorf("provider failure must end the call: %v", err)
 	}
 }

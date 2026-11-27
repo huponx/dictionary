@@ -36,16 +36,16 @@ func seedUser(t *testing.T, s *Store, user string, words int) {
 		args []any
 	}{
 		{`INSERT INTO dictionary_user_stats (user_id, listed) VALUES ($1, $2)`, []any{user, words}},
-		{`INSERT INTO dictionary_saved_words (user_id, word, content) SELECT $1, 'w' || g, 'c' FROM generate_series(1, $2) g`, []any{user, words}},
+		{`INSERT INTO dictionary_saved_words (user_id, grp, word, content) SELECT $1, 'en', 'w' || g, 'c' FROM generate_series(1, $2) g`, []any{user, words}},
 		{`INSERT INTO dictionary_images (id, user_id, content_type, size, sha256) VALUES ($2, $1, 'image/png', 10, '\x01')`, []any{user, img}},
 		{`INSERT INTO dictionary_audio (id, user_id, content_type, size, sha256) VALUES ($2, $1, 'audio/mpeg', 10, '\x02')`, []any{user, aud}},
 		{`INSERT INTO dictionary_categories (id, user_id, name) VALUES ($2, $1, 'cat')`, []any{user, cat}},
-		{`INSERT INTO dictionary_image_refs (user_id, word, image_id) SELECT $1, 'w' || g, $2 FROM generate_series(1, least($3, 50)) g`, []any{user, img, words}},
-		{`INSERT INTO dictionary_audio_refs (user_id, word, audio_id) SELECT $1, 'w' || g, $2 FROM generate_series(1, least($3, 50)) g`, []any{user, aud, words}},
-		{`INSERT INTO dictionary_word_categories (user_id, word, category_id) SELECT $1, 'w' || g, $2 FROM generate_series(1, $3) g`, []any{user, cat, words}},
-		{`INSERT INTO dictionary_review_state (user_id, word, due_at, first_reviewed_at, last_reviewed_at)
-			SELECT $1, 'w' || g, now(), now(), now() FROM generate_series(1, $2) g`, []any{user, words}},
-		{`INSERT INTO dictionary_review_log (user_id, word, reviewed_at, grade) SELECT $1, 'w' || g, now(), 3 FROM generate_series(1, $2) g`, []any{user, words}},
+		{`INSERT INTO dictionary_image_refs (user_id, grp, word, image_id) SELECT $1, 'en', 'w' || g, $2 FROM generate_series(1, least($3, 50)) g`, []any{user, img, words}},
+		{`INSERT INTO dictionary_audio_refs (user_id, grp, word, audio_id) SELECT $1, 'en', 'w' || g, $2 FROM generate_series(1, least($3, 50)) g`, []any{user, aud, words}},
+		{`INSERT INTO dictionary_word_categories (user_id, grp, word, category_id) SELECT $1, 'en', 'w' || g, $2 FROM generate_series(1, $3) g`, []any{user, cat, words}},
+		{`INSERT INTO dictionary_review_state (user_id, grp, word, due_at, first_reviewed_at, last_reviewed_at)
+			SELECT $1, 'en', 'w' || g, now(), now(), now() FROM generate_series(1, $2) g`, []any{user, words}},
+		{`INSERT INTO dictionary_review_log (user_id, grp, word, reviewed_at, grade) SELECT $1, 'en', 'w' || g, now(), 3 FROM generate_series(1, $2) g`, []any{user, words}},
 		{`INSERT INTO dictionary_export_jobs (id, user_id, status, params, expires_at) VALUES ($2, $1, 'done', '{}', now() + interval '1 day')`, []any{user, job}},
 		{`INSERT INTO dictionary_export_parts (job_id, n, filename, file_id, word_count, size) VALUES ($1, 1, 'a.apkg', $2, 1, 1)`, []any{job, uuid.NewString()}},
 		{`INSERT INTO dictionary_deck_links (token_hash, user_id, filename, data, word_count, expires_at) VALUES ($2, $1, 'd.apkg', '\x00', 1, now() + interval '1 day')`, []any{user, []byte(uuid.NewString())}},
@@ -103,7 +103,7 @@ func TestPurgeDeletedUser(t *testing.T) {
 	}
 	// and a deleted one saves nothing
 	softDelete(t, s, user)
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "late"}, 1<<30, testQuota, nil); !errors.Is(err, ErrUnknownUser) {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "late"}, 1<<30, testQuota, nil); !errors.Is(err, ErrUnknownUser) {
 		t.Fatalf("save by a deleted user: %v", err)
 	}
 
@@ -191,7 +191,7 @@ func TestPurgeParallelWithSaves(t *testing.T) {
 				return
 			default:
 			}
-			_, err := s.SaveWord(ctx, user, SavedWord{Word: "s" + uuid.NewString(), Content: "x"}, 1<<30, testQuota, nil)
+			_, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "s" + uuid.NewString(), Content: "x"}, 1<<30, testQuota, nil)
 			if err != nil && !errors.Is(err, ErrUnknownUser) {
 				select {
 				case saveErr <- err:

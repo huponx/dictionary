@@ -76,8 +76,9 @@ const (
 	keyMaxSaved   = "max_saved_words"
 	keyExportDeck = "allow_export_deck"
 	keyExportLink = "allow_export_link"
-	keyEnglish    = "english_enabled"
-	keyEnglishVi  = "english_vi_enabled"
+	// keyDictionaries holds one JSON object {dictionary id: enabled}; an id the registry has and the object lacks
+	// takes the default of the registry.
+	keyDictionaries = "dictionaries"
 
 	keyRemoveAfterExport = "remove_after_export"
 	keyRetentionHours    = "exported_retention_hours"
@@ -95,19 +96,15 @@ const (
 	keyAudioUserQuota   = "audio_user_quota"
 )
 
-// Dictionary names used in the preferences.
-const (
-	English           = "english"
-	EnglishVietnamese = "english_vi"
-)
-
 // System is the settings of the whole system.
 type System struct {
-	MaxSavedWords    int
-	AllowExportDeck  bool
-	AllowExportLink  bool
-	EnglishEnabled   bool
-	EnglishViEnabled bool
+	MaxSavedWords   int
+	AllowExportDeck bool
+	AllowExportLink bool
+	// Dictionaries tells for every dictionary of the registry whether it can be looked up; DictionaryOrder is the
+	// registry order (the first one that is on is the fallback of a default dictionary).
+	Dictionaries    map[string]bool
+	DictionaryOrder []string
 	// RemoveAfterExport: an export takes the words out of the list (a user can turn it off for themself).
 	RemoveAfterExport bool
 	// ExportedRetentionHours is how long a word that left the list is kept before the cleanup deletes it.
@@ -137,7 +134,7 @@ type System struct {
 // Defaults are the settings of a system nobody changed: everything on.
 func Defaults(maxSaved, retentionHours int) System {
 	return System{
-		MaxSavedWords: maxSaved, AllowExportDeck: true, AllowExportLink: true, EnglishEnabled: true, EnglishViEnabled: true,
+		MaxSavedWords: maxSaved, AllowExportDeck: true, AllowExportLink: true,
 		RemoveAfterExport: true, ExportedRetentionHours: retentionHours,
 		MaxCategories: DefaultMaxCategories, MaxCategoryNameLength: DefaultMaxCategoryName,
 		ExportMaxBytes: DefaultExportMaxBytes, ExportPartMaxBytes: DefaultExportPartMaxBytes, ExportSyncMaxWords: DefaultExportSyncWords,
@@ -195,13 +192,26 @@ func (s System) WithExportSyncMaxWords(n int) System {
 	return s
 }
 
-// Enabled reports whether a dictionary ("english", "english_vi") can be looked up.
-func (s System) Enabled(dictionary string) bool {
-	switch dictionary {
-	case English:
-		return s.EnglishEnabled
-	case EnglishVietnamese:
-		return s.EnglishViEnabled
+// WithDictionaries sets the dictionaries of the registry: their order and whether each is on until somebody
+// chooses. Call it before FromRows.
+func (s System) WithDictionaries(order []string, defaults map[string]bool) System {
+	s.DictionaryOrder = append([]string(nil), order...)
+	s.Dictionaries = make(map[string]bool, len(order))
+	for _, id := range order {
+		s.Dictionaries[id] = defaults[id]
+	}
+	return s
+}
+
+// Enabled reports whether a dictionary of the registry can be looked up; false for an unknown id.
+func (s System) Enabled(dictionary string) bool { return s.Dictionaries[dictionary] }
+
+// known reports whether the id is in the registry the settings were built for.
+func (s System) known(dictionary string) bool {
+	for _, id := range s.DictionaryOrder {
+		if id == dictionary {
+			return true
+		}
 	}
 	return false
 }
@@ -243,7 +253,14 @@ func (s System) Validate() error {
 	if s.ExportSyncMaxWords < MinExportSyncWords || s.ExportSyncMaxWords > MaxExportSyncWords {
 		return fmt.Errorf("words of a synchronous export must be between %d and %d", MinExportSyncWords, MaxExportSyncWords)
 	}
-	if !s.EnglishEnabled && !s.EnglishViEnabled {
+	on := false
+	for id, enabled := range s.Dictionaries {
+		if !s.known(id) {
+			return fmt.Errorf("unknown dictionary %q", id)
+		}
+		on = on || enabled
+	}
+	if !on {
 		return errors.New("at least one dictionary must stay enabled")
 	}
 	return nil
@@ -301,13 +318,26 @@ func FromRows(rows map[string]json.RawMessage, def System) System {
 	}
 	for key, dst := range map[string]*bool{
 		keyExportDeck: &out.AllowExportDeck, keyExportLink: &out.AllowExportLink,
-		keyEnglish: &out.EnglishEnabled, keyEnglishVi: &out.EnglishViEnabled,
 		keyRemoveAfterExport: &out.RemoveAfterExport,
 	} {
 		if v, ok := rows[key]; ok {
 			var b bool
 			if json.Unmarshal(v, &b) == nil {
 				*dst = b
+			}
+		}
+	}
+	if v, ok := rows[keyDictionaries]; ok {
+		var m map[string]bool
+		if json.Unmarshal(v, &m) == nil {
+			// a copy: def is shared and its map must not change; an id the registry does not have (a dictionary that
+			// was removed) is ignored
+			out.Dictionaries = make(map[string]bool, len(def.Dictionaries))
+			for id, on := range def.Dictionaries {
+				if set, ok := m[id]; ok {
+					on = set
+				}
+				out.Dictionaries[id] = on
 			}
 		}
 	}
@@ -318,7 +348,7 @@ func (s System) rows() map[string]json.RawMessage {
 	enc := func(v any) json.RawMessage { b, _ := json.Marshal(v); return b }
 	return map[string]json.RawMessage{
 		keyMaxSaved: enc(s.MaxSavedWords), keyExportDeck: enc(s.AllowExportDeck), keyExportLink: enc(s.AllowExportLink),
-		keyEnglish: enc(s.EnglishEnabled), keyEnglishVi: enc(s.EnglishViEnabled),
+		keyDictionaries:      enc(s.Dictionaries),
 		keyRemoveAfterExport: enc(s.RemoveAfterExport), keyRetentionHours: enc(s.ExportedRetentionHours),
 		keyMaxCategories: enc(s.MaxCategories), keyMaxCategoryName: enc(s.MaxCategoryNameLength),
 		keyExportMaxBytes: enc(s.ExportMaxBytes), keyExportPartMaxBytes: enc(s.ExportPartMaxBytes), keyExportSyncWords: enc(s.ExportSyncMaxWords),
@@ -342,8 +372,10 @@ func Changed(current, next System) map[string]json.RawMessage {
 
 // User is the preferences of one user. They only narrow what System allows.
 type User struct {
-	EnglishEnabled    bool
-	EnglishViEnabled  bool
+	// Dictionaries is what the user turned on or off, by id; an id that is missing is on (the system decides which
+	// dictionaries exist and which are enabled).
+	Dictionaries map[string]bool
+	// DefaultDictionary is the id selected first; empty until the user chose (the first dictionary that is on).
 	DefaultDictionary string
 	DeckName          string
 	MaxLookupWords    int
@@ -366,20 +398,19 @@ type User struct {
 	DesiredRetention int
 }
 
-// UserDefaults are the preferences of a user who never chose: everything on, English first.
+// UserDefaults are the preferences of a user who never chose: every dictionary on, the first one selected.
 func UserDefaults() User {
-	return User{EnglishEnabled: true, EnglishViEnabled: true, DefaultDictionary: English, MaxLookupWords: MaxLookupLimit, RemoveAfterExport: true,
+	return User{MaxLookupWords: MaxLookupLimit, RemoveAfterExport: true,
 		ReviewNewPerDay: DefaultReviewNewPerDay, ReviewMaxPerDay: DefaultReviewMaxPerDay,
 		ReviewAlgorithm: AlgorithmSM2, DesiredRetention: DefaultDesiredRetention}
 }
 
 // userJSON is what is stored; a pointer tells a missing key from a false one.
 type userJSON struct {
-	EnglishEnabled    *bool  `json:"englishEnabled,omitempty"`
-	EnglishViEnabled  *bool  `json:"englishViEnabled,omitempty"`
-	DefaultDictionary string `json:"defaultDictionary,omitempty"`
-	DeckName          string `json:"deckName,omitempty"`
-	MaxLookupWords    int    `json:"maxLookupWords,omitempty"`
+	Dictionaries      map[string]bool `json:"dictionaries,omitempty"`
+	DefaultDictionary string          `json:"defaultDictionary,omitempty"`
+	DeckName          string          `json:"deckName,omitempty"`
+	MaxLookupWords    int             `json:"maxLookupWords,omitempty"`
 
 	RemoveAfterExport  *bool `json:"removeAfterExport,omitempty"`
 	RemoveAcknowledged bool  `json:"removeAcknowledged,omitempty"`
@@ -399,15 +430,8 @@ func ParseUser(raw string) User {
 	if strings.TrimSpace(raw) == "" || json.Unmarshal([]byte(raw), &j) != nil {
 		return out
 	}
-	if j.EnglishEnabled != nil {
-		out.EnglishEnabled = *j.EnglishEnabled
-	}
-	if j.EnglishViEnabled != nil {
-		out.EnglishViEnabled = *j.EnglishViEnabled
-	}
-	if j.DefaultDictionary == English || j.DefaultDictionary == EnglishVietnamese {
-		out.DefaultDictionary = j.DefaultDictionary
-	}
+	out.Dictionaries = j.Dictionaries
+	out.DefaultDictionary = j.DefaultDictionary
 	if j.RemoveAfterExport != nil {
 		out.RemoveAfterExport = *j.RemoveAfterExport
 	}
@@ -435,7 +459,7 @@ func ParseUser(raw string) User {
 // JSON is the object to store.
 func (u User) JSON() string {
 	b, _ := json.Marshal(userJSON{
-		EnglishEnabled: &u.EnglishEnabled, EnglishViEnabled: &u.EnglishViEnabled,
+		Dictionaries:      u.Dictionaries,
 		DefaultDictionary: u.DefaultDictionary, DeckName: u.DeckName, MaxLookupWords: u.MaxLookupWords,
 		RemoveAfterExport: &u.RemoveAfterExport, RemoveAcknowledged: u.RemoveAcknowledged, FreshDeck: u.FreshDeck,
 		ReviewNewPerDay: &u.ReviewNewPerDay, ReviewMaxPerDay: &u.ReviewMaxPerDay,
@@ -446,13 +470,21 @@ func (u User) JSON() string {
 
 // Allows reports whether a dictionary is on for the user and for the system.
 func (u User) Allows(sys System, dictionary string) bool {
-	switch dictionary {
-	case English:
-		return u.EnglishEnabled && sys.EnglishEnabled
-	case EnglishVietnamese:
-		return u.EnglishViEnabled && sys.EnglishViEnabled
+	if !sys.Enabled(dictionary) {
+		return false
 	}
-	return false
+	on, chosen := u.Dictionaries[dictionary]
+	return on || !chosen
+}
+
+// firstAllowed is the first dictionary of the registry order that is on for the user, "" when none is.
+func (u User) firstAllowed(sys System) string {
+	for _, id := range sys.DictionaryOrder {
+		if u.Allows(sys, id) {
+			return id
+		}
+	}
+	return ""
 }
 
 // RemovesAfterExport reports whether an export takes the words out of the list: the system allows it and the
@@ -461,8 +493,8 @@ func (u User) RemovesAfterExport(sys System) bool {
 	return u.RemoveAfterExport && sys.RemoveAfterExport
 }
 
-// Validate checks what a user sends against what the system allows: one dictionary at least, and the default
-// is one of the dictionaries that are on.
+// Validate checks what a user sends against what the system allows: only dictionaries of the registry, one at
+// least, and the default is one of the dictionaries that are on.
 func (u User) Validate(sys System) error {
 	if u.MaxLookupWords < 1 || u.MaxLookupWords > MaxLookupLimit {
 		return fmt.Errorf("words per lookup must be between 1 and %d", MaxLookupLimit)
@@ -479,30 +511,37 @@ func (u User) Validate(sys System) error {
 	if u.DesiredRetention < MinDesiredRetention || u.DesiredRetention > MaxDesiredRetention {
 		return fmt.Errorf("desired retention must be between %d and %d", MinDesiredRetention, MaxDesiredRetention)
 	}
-	if !u.Allows(sys, English) && !u.Allows(sys, EnglishVietnamese) {
+	for id := range u.Dictionaries {
+		if !sys.known(id) {
+			return fmt.Errorf("unknown dictionary %q", id)
+		}
+	}
+	if u.firstAllowed(sys) == "" {
 		return errors.New("at least one dictionary must stay enabled")
 	}
-	if u.DefaultDictionary != English && u.DefaultDictionary != EnglishVietnamese {
+	// empty: the user never chose, the first dictionary that is on is selected (see Effective)
+	if u.DefaultDictionary != "" && !sys.known(u.DefaultDictionary) {
 		return errors.New("unknown default dictionary")
 	}
-	if !u.Allows(sys, u.DefaultDictionary) {
+	if u.DefaultDictionary != "" && !u.Allows(sys, u.DefaultDictionary) {
 		return errors.New("the default dictionary must be an enabled one")
 	}
 	return nil
 }
 
-// Effective returns the preferences as they work now: a dictionary the system turned off since is off for
-// the user too and the default moves to one that is on.
+// Effective returns the preferences as they work now: every dictionary of the registry with whether it is on for
+// the user and the system, and a default that is on (a dictionary the system turned off since moves it to the
+// first one that is on).
 func (u User) Effective(sys System) User {
-	u.EnglishEnabled = u.Allows(sys, English)
-	u.EnglishViEnabled = u.Allows(sys, EnglishVietnamese)
+	on := make(map[string]bool, len(sys.DictionaryOrder))
+	for _, id := range sys.DictionaryOrder {
+		on[id] = u.Allows(sys, id)
+	}
 	if !u.Allows(sys, u.DefaultDictionary) {
-		switch {
-		case u.EnglishEnabled:
-			u.DefaultDictionary = English
-		case u.EnglishViEnabled:
-			u.DefaultDictionary = EnglishVietnamese
+		if first := u.firstAllowed(sys); first != "" {
+			u.DefaultDictionary = first
 		}
 	}
+	u.Dictionaries = on
 	return u
 }

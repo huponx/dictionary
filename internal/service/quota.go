@@ -97,6 +97,33 @@ func (s *Service) GetUserQuota(ctx context.Context, req *dictionaryv1.GetUserQuo
 	return &dictionaryv1.GetUserQuotaResponse{Used: used, Override: override, Effective: effective}, nil
 }
 
+// RecalculateUserStorage recomputes the counters of a user from the rows and answers like GetUserQuota, plus the
+// counters before.
+func (s *Service) RecalculateUserStorage(ctx context.Context, req *dictionaryv1.RecalculateUserStorageRequest) (*dictionaryv1.RecalculateUserStorageResponse, error) {
+	user, err := adminUser(req.GetUserId())
+	if err != nil {
+		return nil, err
+	}
+	was, _, err := s.store.RecomputeUserCounters(ctx, user)
+	if errors.Is(err, store.ErrUnknownUser) {
+		return nil, apperror.NotFound("user not found").WithReason("user_not_found")
+	}
+	if err != nil {
+		return nil, internal(ctx, "recalculate storage", err)
+	}
+	u, err := s.store.GetStorageUsage(ctx, user)
+	if err != nil {
+		return nil, internal(ctx, "storage usage", err)
+	}
+	sys, err := s.system(ctx)
+	if err != nil {
+		return nil, err
+	}
+	used, override, effective := userQuota(u, sys)
+	return &dictionaryv1.RecalculateUserStorageResponse{Used: used, Override: override, Effective: effective,
+		Previous: quotaTriple(was.ContentBytes, was.ImageBytes, was.AudioBytes)}, nil
+}
+
 // SetUserQuota sets the own limits of a user: 0 or absent removes the limit of a kind. A limit above the ceiling
 // of the settings is refused.
 func (s *Service) SetUserQuota(ctx context.Context, req *dictionaryv1.SetUserQuotaRequest) (*dictionaryv1.SetUserQuotaResponse, error) {

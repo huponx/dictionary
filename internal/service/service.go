@@ -32,48 +32,10 @@ import (
 	"google.golang.org/grpc/codes"
 )
 
-// Permissions required per method. grpcserver.WithMethodPermissions is deny by default, so a new RPC
-// has no entry here until somebody decides who may call it.
-var Permissions = map[string]string{
-	"/dictionary.v1.DictionaryService/LookupWord":           "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/LookupWords":          "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/ListSavedWords":       "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/SaveWord":             "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/DeleteSavedWord":      "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/ExportAnki":           "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/CreateDeckLink":       "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/RemoveExportedWords":  "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/CheckSavedWords":      "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/StartExport":          "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/GetExport":            "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/CancelExport":         "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/CreateExportPartLink": "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/ListCategories":       "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/CreateCategory":       "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/RenameCategory":       "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/DeleteCategory":       "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/UpdateWordCategories": "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/UploadImage":          "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/GetImage":             "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/UploadAudio":          "dictionary:word:write",
-	"/dictionary.v1.DictionaryService/GetAudio":             "dictionary:word:read",
-	// the review changes no word of the list, only the schedule of the user: reading is enough, like UpdateMySettings
-	"/dictionary.v1.DictionaryService/GetReviewQueue":           "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/SubmitReview":             "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/AddReviewBonus":           "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/OptimizeReviewParameters": "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/GetSettings":              "dictionary:settings:read",
-	"/dictionary.v1.DictionaryService/UpdateSettings":           "dictionary:settings:write",
-	"/dictionary.v1.DictionaryService/GetUserQuota":             "dictionary:settings:read",
-	"/dictionary.v1.DictionaryService/SetUserQuota":             "dictionary:settings:write",
-	"/dictionary.v1.DictionaryService/GetMyStorage":             "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/GetMySettings":            "dictionary:word:read",
-	"/dictionary.v1.DictionaryService/UpdateMySettings":         "dictionary:word:read",
-	// the gateway calls it for the anonymous download request with its service token: any authenticated
-	// caller passes the permission check, the method itself accepts only a service token
-	"/dictionary.v1.DictionaryService/DownloadDeck":       grpcserver.Public,
-	"/dictionary.v1.DictionaryService/DownloadExportPart": grpcserver.Public,
-}
+// Permissions is the rule of every method, read from the authz.v1.rule options of dictionary.proto (the permissions
+// themselves are declared in permissions.proto and registered with identity at start). grpcserver.WithMethodPermissions
+// is deny by default: an RPC without a rule is closed, and TestCoverage fails the build for it.
+var Permissions = grpcserver.PermissionsFromProto(dictionaryv1.File_dictionary_v1_dictionary_proto, dictionaryv1.File_dictionary_v1_permissions_proto)
 
 // Messages of the errors a client may want to recognize start with these codes.
 const (
@@ -125,8 +87,8 @@ const (
 
 // Looker finds the entries of words.
 type Looker interface {
-	Lookup(ctx context.Context, d lookup.Dictionary, word string) (*lookup.Word, error)
-	LookupMany(ctx context.Context, d lookup.Dictionary, words []string) (found []*lookup.Word, notFound []string, err error)
+	Lookup(ctx context.Context, d string, word string) (*lookup.Word, error)
+	LookupMany(ctx context.Context, d string, words []string) (found []*lookup.Word, notFound []string, err error)
 }
 
 // Store keeps the saved words (the store package).
@@ -135,14 +97,14 @@ type Store interface {
 	CountPending(ctx context.Context, userID string, f store.WordFilter) (total, fresh int, capped bool, err error)
 	ListPending(ctx context.Context, userID string, afterCreated time.Time, afterWord, query string, f store.WordFilter, limit int) ([]store.SavedWord, error)
 	Pending(ctx context.Context, userID string, scope store.Scope, f store.WordFilter, words []string, limit int) ([]store.SavedWord, error)
-	ListCategories(ctx context.Context, userID string) (store.Categories, error)
+	ListCategories(ctx context.Context, userID, group string) (store.Categories, error)
 	CategoryName(ctx context.Context, userID, id string) (string, error)
 	CreateCategory(ctx context.Context, userID, name string, max int) (store.Category, error)
 	RenameCategory(ctx context.Context, userID, id, name string) (store.Category, error)
 	DeleteCategory(ctx context.Context, userID, id string) error
-	SetWordCategories(ctx context.Context, userID string, words, add, remove []string) (int, error)
-	DeletePending(ctx context.Context, userID, word string) error
-	SavedByNames(ctx context.Context, userID string, words []string) (map[string][]string, error)
+	SetWordCategories(ctx context.Context, userID, group string, words, add, remove []string) (int, error)
+	DeletePending(ctx context.Context, userID, group, word string) error
+	SavedByNames(ctx context.Context, userID, group string, words []string) (map[string][]string, error)
 	PendingPage(ctx context.Context, userID string, scope store.Scope, f store.WordFilter, afterCreated time.Time, afterWord string, limit int) ([]store.SavedWord, error)
 	CountExportable(ctx context.Context, userID string, scope store.Scope, f store.WordFilter) (int, error)
 	CreateExportJob(ctx context.Context, userID string, p store.ExportParams, ttl time.Duration) (store.ExportJob, error)
@@ -158,14 +120,15 @@ type Store interface {
 	ExportPartByToken(ctx context.Context, hash []byte, now time.Time) (userID string, p store.ExportPart, err error)
 	DeleteExpiredExportJobs(ctx context.Context, now time.Time, limit int) (int, []store.ExpiredFile, error)
 	ExistingExportFileIDs(ctx context.Context, ids []string) (map[string]bool, error)
-	MarkExported(ctx context.Context, userID string, words []string, remove bool) (int64, error)
-	RemoveExported(ctx context.Context, userID string) (int64, error)
+	MarkExported(ctx context.Context, userID, group string, words []string, remove bool) (int64, error)
+	RemoveExported(ctx context.Context, userID, group string) (int64, error)
 	PutDeckLink(ctx context.Context, userID string, tokenHash []byte, l store.DeckLink) error
 	TakeDeckLink(ctx context.Context, tokenHash []byte, now time.Time) (*store.DeckLink, error)
 	Settings(ctx context.Context) (map[string]json.RawMessage, error)
 	PutSettings(ctx context.Context, rows map[string]json.RawMessage) error
 	GetStorageUsage(ctx context.Context, userID string) (store.StorageUsage, error)
 	SetStorageQuota(ctx context.Context, userID string, q store.Quotas) error
+	RecomputeUserCounters(ctx context.Context, userID string) (was, now store.Counters, err error)
 	ImageBySHA(ctx context.Context, userID string, sha []byte) (*store.Image, error)
 	GetImage(ctx context.Context, userID, id string) (*store.Image, error)
 	ImagesByIDs(ctx context.Context, userID string, ids []string) ([]store.Image, error)
@@ -176,10 +139,10 @@ type Store interface {
 	InsertAudio(ctx context.Context, a store.Audio) (existing *store.Audio, inserted bool, err error)
 	ReviewQueue(ctx context.Context, userID string, now time.Time, f store.WordFilter, limit, dueAllowed, newAllowed int) ([]store.ReviewCard, error)
 	ReviewCounts(ctx context.Context, userID string, now time.Time, f store.WordFilter) (store.ReviewCounts, error)
-	ReviewToday(ctx context.Context, userID string, now time.Time) (newWords, again int, err error)
+	ReviewToday(ctx context.Context, userID, group string, now time.Time) (newWords, again int, err error)
 	ReviewBonus(ctx context.Context, userID string, now time.Time) (store.ReviewBonus, error)
 	AddReviewBonus(ctx context.Context, userID string, now time.Time, newWords, reviews int) (store.ReviewBonus, error)
-	PutReview(ctx context.Context, userID, word string, now time.Time, grade srs.Grade, next func(srs.State) srs.State) (srs.State, error)
+	PutReview(ctx context.Context, userID, group, word string, now time.Time, grade srs.Grade, next func(srs.State) srs.State) (srs.State, error)
 	FSRSParams(ctx context.Context, userID string) (*store.FSRSParams, error)
 	PutFSRSParams(ctx context.Context, userID string, p store.FSRSParams) error
 	DeleteFSRSParams(ctx context.Context, userID string) error
@@ -229,10 +192,12 @@ type Service struct {
 	dictionaryv1.UnimplementedDictionaryServiceServer
 
 	looker Looker
-	store  Store
-	decks  Decks
-	cfg    Config
-	prefs  Prefs
+	// registry lists the dictionaries and their groups
+	registry *lookup.Registry
+	store    Store
+	decks    Decks
+	cfg      Config
+	prefs    Prefs
 	// now is the clock; tests set it
 	now func() time.Time
 
@@ -276,14 +241,14 @@ func (s *Service) WithPrefs(p Prefs) *Service {
 }
 
 // New builds the service.
-func New(looker Looker, st Store, decks Decks, cfg Config) *Service {
+func New(looker Looker, registry *lookup.Registry, st Store, decks Decks, cfg Config) *Service {
 	if cfg.ExportJobTTL <= 0 {
 		cfg.ExportJobTTL = 24 * time.Hour
 	}
 	if cfg.DeckLinkTTL <= 0 {
 		cfg.DeckLinkTTL = 15 * time.Minute
 	}
-	return &Service{looker: looker, store: st, decks: decks, cfg: cfg, now: time.Now, optimizing: make(chan struct{}, maxOptimizing)}
+	return &Service{looker: looker, registry: registry, store: st, decks: decks, cfg: cfg, now: time.Now, optimizing: make(chan struct{}, maxOptimizing)}
 }
 
 // userID is the user of the request: the subject of the token, never a field of the request. A service
@@ -302,14 +267,22 @@ func userID(ctx context.Context) (string, error) {
 	return p.Subject, nil
 }
 
-func dictionaryOf(d dictionaryv1.Dictionary) (lookup.Dictionary, error) {
-	switch d {
-	case dictionaryv1.Dictionary_DICTIONARY_UNSPECIFIED, dictionaryv1.Dictionary_DICTIONARY_ENGLISH:
-		return lookup.English, nil
-	case dictionaryv1.Dictionary_DICTIONARY_ENGLISH_VIETNAMESE:
-		return lookup.EnglishVietnamese, nil
+// entryOf finds the dictionary of a request in the registry: the id is required.
+func (s *Service) entryOf(id string) (lookup.Entry, error) {
+	e, ok := s.registry.Entry(id)
+	if !ok {
+		return lookup.Entry{}, apperror.InvalidArgument("unknown dictionary").WithReason("unknown_dictionary")
 	}
-	return "", apperror.InvalidArgument("unknown dictionary").WithReason("unknown_dictionary")
+	return e, nil
+}
+
+// groupOf finds the group of a request in the registry: the group is required, a request has no default.
+func (s *Service) groupOf(id string) (lookup.Group, error) {
+	g, ok := s.registry.Group(id)
+	if !ok {
+		return lookup.Group{}, apperror.InvalidArgument("unknown group").WithReason("unknown_group")
+	}
+	return g, nil
 }
 
 // lookupErr maps the errors of a lookup. Details of a provider failure are logged, not sent.
@@ -347,14 +320,14 @@ func toProtoWord(w *lookup.Word) *dictionaryv1.Word {
 
 // LookupWord returns the entry of one word.
 func (s *Service) LookupWord(ctx context.Context, req *dictionaryv1.LookupWordRequest) (*dictionaryv1.LookupWordResponse, error) {
-	d, err := dictionaryOf(req.GetDictionary())
+	e, err := s.entryOf(req.GetDictionary())
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireDictionary(ctx, d); err != nil {
+	if err := s.requireDictionary(ctx, e.ID); err != nil {
 		return nil, err
 	}
-	w, err := s.looker.Lookup(ctx, d, req.GetWord())
+	w, err := s.looker.Lookup(ctx, e.ID, req.GetWord())
 	if err != nil {
 		return nil, lookupErr(ctx, err)
 	}
@@ -363,17 +336,17 @@ func (s *Service) LookupWord(ctx context.Context, req *dictionaryv1.LookupWordRe
 
 // LookupWords returns the entries of several words; the words without an entry are listed apart.
 func (s *Service) LookupWords(ctx context.Context, req *dictionaryv1.LookupWordsRequest) (*dictionaryv1.LookupWordsResponse, error) {
-	d, err := dictionaryOf(req.GetDictionary())
+	e, err := s.entryOf(req.GetDictionary())
 	if err != nil {
 		return nil, err
 	}
 	if n := len(req.GetWords()); n == 0 || n > maxLookupWords {
 		return nil, apperror.InvalidArgument("send between 1 and 20 words").WithReason("word_batch_range", "max", "20")
 	}
-	if err := s.requireDictionary(ctx, d); err != nil {
+	if err := s.requireDictionary(ctx, e.ID); err != nil {
 		return nil, err
 	}
-	found, notFound, err := s.looker.LookupMany(ctx, d, req.GetWords())
+	found, notFound, err := s.looker.LookupMany(ctx, e.ID, req.GetWords())
 	if err != nil {
 		return nil, lookupErr(ctx, err)
 	}
@@ -391,12 +364,19 @@ func (s *Service) SaveWord(ctx context.Context, req *dictionaryv1.SaveWordReques
 		return nil, err
 	}
 	defer s.cats.forget(user)
+	group, err := s.groupOf(req.GetGroup())
+	if err != nil {
+		return nil, err
+	}
 	word, err := lookup.NormalizeWord(req.GetWord())
 	if err != nil {
 		return nil, lookupErr(ctx, err)
 	}
 	sys, err := s.system(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.requireGroupAllowed(ctx, sys, group); err != nil {
 		return nil, err
 	}
 	if len(req.GetContent()) > sys.MaxContentBytes {
@@ -411,7 +391,7 @@ func (s *Service) SaveWord(ctx context.Context, req *dictionaryv1.SaveWordReques
 		return nil, apperror.InvalidArgument("a card can have at most 20 images").WithReason("too_many_images", "max", "20")
 	}
 	n, err := s.store.SaveWord(ctx, user, store.SavedWord{
-		Word: word, Content: req.GetContent(), AudioUK: req.GetAudioUk(), AudioUS: req.GetAudioUs(),
+		Group: group.ID, Word: word, Content: req.GetContent(), AudioUK: req.GetAudioUk(), AudioUS: req.GetAudioUs(),
 	}, sys.MaxSavedWords, sys.ContentUserQuota, req.GetCategoryIds())
 	switch {
 	case err == nil:
@@ -462,7 +442,10 @@ func (s *Service) ListSavedWords(ctx context.Context, req *dictionaryv1.ListSave
 		}
 		afterWord = parts[1]
 	}
-	filter := wordFilter(req.GetCategoryId(), req.GetUncategorized())
+	filter, err := s.wordFilter(req.GetGroup(), req.GetCategoryId(), req.GetUncategorized())
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.store.ListPending(ctx, user, afterCreated, afterWord, query, filter, size+1)
 	if err != nil {
 		return nil, internal(ctx, "list saved words", err)
@@ -483,7 +466,7 @@ func (s *Service) ListSavedWords(ctx context.Context, req *dictionaryv1.ListSave
 			next = r.NextReview.UTC().Format(time.RFC3339)
 		}
 		resp.Words = append(resp.Words, &dictionaryv1.SavedWord{
-			Word: r.Word, Content: r.Content, AudioUk: r.AudioUK, AudioUs: r.AudioUS,
+			Group: r.Group, Word: r.Word, Content: r.Content, AudioUk: r.AudioUK, AudioUs: r.AudioUS,
 			CreatedAt: r.CreatedAt.UTC().Format(time.RFC3339), Exported: r.Exported, CategoryIds: r.CategoryIDs,
 			NextReviewAt: next, Learning: r.Learning,
 		})
@@ -500,6 +483,10 @@ func (s *Service) CheckSavedWords(ctx context.Context, req *dictionaryv1.CheckSa
 	if err != nil {
 		return nil, err
 	}
+	group, err := s.groupOf(req.GetGroup())
+	if err != nil {
+		return nil, err
+	}
 	if len(req.GetWords()) > maxCheckWords {
 		return nil, apperror.InvalidArgument(fmt.Sprintf("send at most %d words", maxCheckWords)).WithReason("word_batch_max", "max", fmt.Sprint(maxCheckWords))
 	}
@@ -513,7 +500,7 @@ func (s *Service) CheckSavedWords(ctx context.Context, req *dictionaryv1.CheckSa
 		seen[n] = true
 		names = append(names, n)
 	}
-	found, err := s.store.SavedByNames(ctx, user, names)
+	found, err := s.store.SavedByNames(ctx, user, group.ID, names)
 	if err != nil {
 		return nil, internal(ctx, "check saved words", err)
 	}
@@ -533,11 +520,15 @@ func (s *Service) DeleteSavedWord(ctx context.Context, req *dictionaryv1.DeleteS
 		return nil, err
 	}
 	defer s.cats.forget(user)
+	group, err := s.groupOf(req.GetGroup())
+	if err != nil {
+		return nil, err
+	}
 	word, err := lookup.NormalizeWord(req.GetWord())
 	if err != nil {
 		return nil, lookupErr(ctx, err)
 	}
-	switch err := s.store.DeletePending(ctx, user, word); {
+	switch err := s.store.DeletePending(ctx, user, group.ID, word); {
 	case err == nil:
 		return &dictionaryv1.DeleteSavedWordResponse{}, nil
 	case errors.Is(err, store.ErrNotFound):
@@ -572,6 +563,7 @@ func (s *Service) useJob(ctx context.Context, user string, src exportSource, f s
 
 // builtDeck is a deck made of the words of a user.
 type builtDeck struct {
+	group string
 	name  string
 	data  []byte
 	words []string
@@ -579,6 +571,7 @@ type builtDeck struct {
 
 // exportSource tells which words an export packs (the fields of ExportAnkiRequest and CreateDeckLinkRequest).
 type exportSource struct {
+	group         string
 	scope         dictionaryv1.ExportScope
 	categoryID    string
 	uncategorized bool
@@ -597,6 +590,11 @@ func (s *Service) buildDeck(ctx context.Context, user, rawName string, src expor
 		filter store.WordFilter
 		only   []string
 	)
+	group, err := s.groupOf(src.group)
+	if err != nil {
+		return nil, err
+	}
+	filter.Group = group.ID
 	switch {
 	case len(src.words) > 0:
 		seen := map[string]bool{}
@@ -611,7 +609,7 @@ func (s *Service) buildDeck(ctx context.Context, user, rawName string, src expor
 			return nil, apperror.InvalidArgument("too many words to export").WithReason("export_too_many_words")
 		}
 	default:
-		filter = wordFilter(src.categoryID, src.uncategorized)
+		filter = categoryFilter(group.ID, src.categoryID, src.uncategorized)
 		if filter.CategoryID != "" {
 			catName, err := s.store.CategoryName(ctx, user, filter.CategoryID)
 			if errors.Is(err, store.ErrNotFound) {
@@ -655,7 +653,7 @@ func (s *Service) buildDeck(ctx context.Context, user, rawName string, src expor
 	if err != nil {
 		return nil, err
 	}
-	return &builtDeck{name: name, data: data, words: keys}, nil
+	return &builtDeck{group: group.ID, name: name, data: data, words: keys}, nil
 }
 
 // packDeck builds the deck of the words: the images and the audio files of the cards are attached, then the deck
@@ -713,24 +711,28 @@ func (s *Service) ExportAnki(ctx context.Context, req *dictionaryv1.ExportAnkiRe
 	if err != nil {
 		return nil, err
 	}
-	d, err := s.buildDeck(ctx, user, req.GetDeckName(), exportSource{req.GetScope(), req.GetCategoryId(), req.GetUncategorized(), req.GetWords()})
+	d, err := s.buildDeck(ctx, user, req.GetDeckName(), exportSource{req.GetGroup(), req.GetScope(), req.GetCategoryId(), req.GetUncategorized(), req.GetWords()})
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.store.MarkExported(ctx, user, d.words, s.removesAfterExport(ctx, sys)); err != nil {
+	if _, err := s.store.MarkExported(ctx, user, d.group, d.words, s.removesAfterExport(ctx, sys)); err != nil {
 		return nil, internal(ctx, "mark exported", err)
 	}
 	return &dictionaryv1.ExportAnkiResponse{Filename: fileName(d.name), Data: d.data, WordCount: int32(len(d.words))}, nil
 }
 
 // RemoveExportedWords takes the exported words out of the list; the new ones stay.
-func (s *Service) RemoveExportedWords(ctx context.Context, _ *dictionaryv1.RemoveExportedWordsRequest) (*dictionaryv1.RemoveExportedWordsResponse, error) {
+func (s *Service) RemoveExportedWords(ctx context.Context, req *dictionaryv1.RemoveExportedWordsRequest) (*dictionaryv1.RemoveExportedWordsResponse, error) {
 	user, err := userID(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer s.cats.forget(user)
-	n, err := s.store.RemoveExported(ctx, user)
+	group, err := s.groupOf(req.GetGroup())
+	if err != nil {
+		return nil, err
+	}
+	n, err := s.store.RemoveExported(ctx, user, group.ID)
 	if err != nil {
 		return nil, internal(ctx, "remove exported words", err)
 	}
@@ -755,7 +757,7 @@ func (s *Service) CreateDeckLink(ctx context.Context, req *dictionaryv1.CreateDe
 	if err != nil {
 		return nil, err
 	}
-	d, err := s.buildDeck(ctx, user, req.GetDeckName(), exportSource{req.GetScope(), req.GetCategoryId(), req.GetUncategorized(), req.GetWords()})
+	d, err := s.buildDeck(ctx, user, req.GetDeckName(), exportSource{req.GetGroup(), req.GetScope(), req.GetCategoryId(), req.GetUncategorized(), req.GetWords()})
 	if err != nil {
 		return nil, err
 	}
@@ -769,7 +771,7 @@ func (s *Service) CreateDeckLink(ctx context.Context, req *dictionaryv1.CreateDe
 	if err := s.store.PutDeckLink(ctx, user, tokenHash(token), link); err != nil {
 		return nil, internal(ctx, "store deck link", err)
 	}
-	if _, err := s.store.MarkExported(ctx, user, d.words, s.removesAfterExport(ctx, sys)); err != nil {
+	if _, err := s.store.MarkExported(ctx, user, d.group, d.words, s.removesAfterExport(ctx, sys)); err != nil {
 		return nil, internal(ctx, "mark exported", err)
 	}
 	return &dictionaryv1.CreateDeckLinkResponse{
@@ -1066,11 +1068,20 @@ func (s *Service) attachImages(ctx context.Context, user string, cards []anki.Wo
 	return nil
 }
 
-// wordFilter is the category filter of a request: uncategorized wins over a category id.
-func wordFilter(categoryID string, uncategorized bool) store.WordFilter {
+// wordFilter is the filter of a request: its group (required, in the registry) and its category filter.
+func (s *Service) wordFilter(group, categoryID string, uncategorized bool) (store.WordFilter, error) {
+	g, err := s.groupOf(group)
+	if err != nil {
+		return store.WordFilter{}, err
+	}
+	return categoryFilter(g.ID, categoryID, uncategorized), nil
+}
+
+// categoryFilter is the filter of a group with the category filter of a request: uncategorized wins over a category id.
+func categoryFilter(group, categoryID string, uncategorized bool) store.WordFilter {
 	// a GET reaches the service as a query string, where the gateway cannot write a bool: the id "uncategorized" says the same
 	if uncategorized || strings.EqualFold(strings.TrimSpace(categoryID), UncategorizedID) {
-		return store.WordFilter{Uncategorized: true}
+		return store.WordFilter{Group: group, Uncategorized: true}
 	}
-	return store.WordFilter{CategoryID: strings.ToLower(strings.TrimSpace(categoryID))}
+	return store.WordFilter{Group: group, CategoryID: strings.ToLower(strings.TrimSpace(categoryID))}
 }

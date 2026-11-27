@@ -51,7 +51,7 @@ func (f *fakeStore) match(word string, flt store.WordFilter) bool {
 	return true
 }
 
-func (f *fakeStore) ListCategories(context.Context, string) (store.Categories, error) {
+func (f *fakeStore) listCategories(context.Context, string) (store.Categories, error) {
 	f.listCalls++
 	out := slices.Clone(f.cats)
 	for i, c := range out {
@@ -115,7 +115,7 @@ func (f *fakeStore) DeleteCategory(_ context.Context, _, id string) error {
 	return nil
 }
 
-func (f *fakeStore) SetWordCategories(_ context.Context, _ string, words, add, remove []string) (int, error) {
+func (f *fakeStore) setWordCategories(_ context.Context, _ string, words, add, remove []string) (int, error) {
 	for _, id := range append(slices.Clone(add), remove...) {
 		if f.category(id) < 0 {
 			return 0, store.ErrNotFound
@@ -142,7 +142,7 @@ func categoryService(t *testing.T, words ...string) (*Service, *fakeStore) {
 	st := newFakeStore()
 	s := newService(st, &fakeDecks{})
 	for _, w := range words {
-		if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: w, Content: "c"}); err != nil {
+		if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: w, Content: "c"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -160,7 +160,7 @@ func mustCategory(t *testing.T, s *Service, name string) string {
 
 func assign(t *testing.T, s *Service, id string, words ...string) {
 	t.Helper()
-	if _, err := s.UpdateWordCategories(userCtx(), &dictionaryv1.UpdateWordCategoriesRequest{Words: words, AddCategoryIds: []string{id}}); err != nil {
+	if _, err := s.UpdateWordCategories(userCtx(), &dictionaryv1.UpdateWordCategoriesRequest{Group: "en", Words: words, AddCategoryIds: []string{id}}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -198,12 +198,12 @@ func TestCategoryLimit(t *testing.T) {
 func TestCategoryPermissionsNeedAUser(t *testing.T) {
 	s, _ := categoryService(t)
 	svc := authn.WithPrincipal(context.Background(), &authn.Principal{Subject: "gatekeeper", ClientID: "gatekeeper"})
-	if _, err := s.ListCategories(svc, &dictionaryv1.ListCategoriesRequest{}); err == nil {
+	if _, err := s.ListCategories(svc, &dictionaryv1.ListCategoriesRequest{Group: "en"}); err == nil {
 		t.Error("a service token must be refused")
 	}
 	for m, want := range map[string]string{"ListCategories": "read", "CreateCategory": "write", "RenameCategory": "write", "DeleteCategory": "write", "UpdateWordCategories": "write"} {
-		if got := Permissions["/dictionary.v1.DictionaryService/"+m]; got != "dictionary:word:"+want {
-			t.Errorf("%s needs %q", m, got)
+		if got := Permissions["/dictionary.v1.DictionaryService/"+m]; len(got.Any) != 1 || got.Any[0] != "dictionary:word:"+want {
+			t.Errorf("%s needs %+v", m, got)
 		}
 	}
 }
@@ -221,17 +221,17 @@ func TestListSavedWordsFiltersByCategory(t *testing.T) {
 		}
 		return r
 	}
-	r := list(&dictionaryv1.ListSavedWordsRequest{CategoryId: a})
+	r := list(&dictionaryv1.ListSavedWordsRequest{Group: "en", CategoryId: a})
 	if len(r.Words) != 2 || r.Total != 2 {
 		t.Errorf("category A: %v total=%d", r.Words, r.Total)
 	}
-	if r := list(&dictionaryv1.ListSavedWordsRequest{CategoryId: "uncategorized"}); len(r.Words) != 1 || r.Words[0].Word != "gamma" {
+	if r := list(&dictionaryv1.ListSavedWordsRequest{Group: "en", CategoryId: "uncategorized"}); len(r.Words) != 1 || r.Words[0].Word != "gamma" {
 		t.Errorf("uncategorized by id: %v", r.Words)
 	}
-	if r := list(&dictionaryv1.ListSavedWordsRequest{Uncategorized: true}); len(r.Words) != 1 || r.Words[0].Word != "gamma" || r.Total != 1 {
+	if r := list(&dictionaryv1.ListSavedWordsRequest{Group: "en", Uncategorized: true}); len(r.Words) != 1 || r.Words[0].Word != "gamma" || r.Total != 1 {
 		t.Errorf("uncategorized: %v", r.Words)
 	}
-	r = list(&dictionaryv1.ListSavedWordsRequest{})
+	r = list(&dictionaryv1.ListSavedWordsRequest{Group: "en"})
 	if r.Total != 3 {
 		t.Errorf("all: %v", r.Total)
 	}
@@ -246,14 +246,14 @@ func TestResaveKeepsCategoriesAndSaveAdds(t *testing.T) {
 	s, _ := categoryService(t, "alpha")
 	a, b := mustCategory(t, s, "A"), mustCategory(t, s, "B")
 	assign(t, s, a, "alpha")
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "alpha", Content: "new", CategoryIds: []string{b}}); err != nil {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "alpha", Content: "new", CategoryIds: []string{b}}); err != nil {
 		t.Fatal(err)
 	}
-	r, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{})
+	r, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en"})
 	if got := r.Words[0].CategoryIds; len(got) != 2 {
 		t.Errorf("categories after re-save: %v", got)
 	}
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "alpha", CategoryIds: []string{"unknown"}}); code(err) != codes.NotFound {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "alpha", CategoryIds: []string{"unknown"}}); code(err) != codes.NotFound {
 		t.Errorf("unknown category on save: %v", err)
 	}
 }
@@ -262,22 +262,22 @@ func TestUpdateWordCategoriesAddsAndRemoves(t *testing.T) {
 	s, _ := categoryService(t, "alpha", "beta")
 	a, b := mustCategory(t, s, "A"), mustCategory(t, s, "B")
 	assign(t, s, a, "alpha", "beta")
-	r, err := s.UpdateWordCategories(userCtx(), &dictionaryv1.UpdateWordCategoriesRequest{
+	r, err := s.UpdateWordCategories(userCtx(), &dictionaryv1.UpdateWordCategoriesRequest{Group: "en",
 		Words: []string{"alpha", "beta", "ghost"}, AddCategoryIds: []string{b}, RemoveCategoryIds: []string{a}})
 	if err != nil || r.Updated != 2 {
 		t.Fatalf("update: %v %v", r, err)
 	}
-	l, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{CategoryId: b})
+	l, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en", CategoryId: b})
 	if len(l.Words) != 2 {
 		t.Errorf("B: %v", l.Words)
 	}
-	if l, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{CategoryId: a}); len(l.Words) != 0 {
+	if l, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en", CategoryId: a}); len(l.Words) != 0 {
 		t.Errorf("A: %v", l.Words)
 	}
-	if _, err := s.UpdateWordCategories(userCtx(), &dictionaryv1.UpdateWordCategoriesRequest{Words: []string{"alpha"}, AddCategoryIds: []string{"nope"}}); code(err) != codes.NotFound {
+	if _, err := s.UpdateWordCategories(userCtx(), &dictionaryv1.UpdateWordCategoriesRequest{Group: "en", Words: []string{"alpha"}, AddCategoryIds: []string{"nope"}}); code(err) != codes.NotFound {
 		t.Errorf("unknown category: %v", err)
 	}
-	if _, err := s.UpdateWordCategories(userCtx(), &dictionaryv1.UpdateWordCategoriesRequest{AddCategoryIds: []string{a}}); code(err) != codes.InvalidArgument {
+	if _, err := s.UpdateWordCategories(userCtx(), &dictionaryv1.UpdateWordCategoriesRequest{Group: "en", AddCategoryIds: []string{a}}); code(err) != codes.InvalidArgument {
 		t.Errorf("no words: %v", err)
 	}
 }
@@ -301,7 +301,7 @@ func TestListCategoriesCounts(t *testing.T) {
 	s, _ := categoryService(t, "alpha", "beta", "gamma")
 	a := mustCategory(t, s, "A")
 	assign(t, s, a, "alpha", "beta")
-	r, err := s.ListCategories(userCtx(), &dictionaryv1.ListCategoriesRequest{})
+	r, err := s.ListCategories(userCtx(), &dictionaryv1.ListCategoriesRequest{Group: "en"})
 	if err != nil || len(r.Categories) != 1 || r.Categories[0].Total != 2 || r.UncategorizedTotal != 1 {
 		t.Errorf("%v %v", r, err)
 	}
@@ -316,17 +316,17 @@ func TestExportByCategoryMarksOnlyThoseWords(t *testing.T) {
 	s, st := categoryService(t, "alpha", "beta", "gamma")
 	a := mustCategory(t, s, "Travel")
 	assign(t, s, a, "alpha", "beta")
-	r, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{CategoryId: a})
+	r, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Group: "en", CategoryId: a})
 	if err != nil || r.WordCount != 2 || r.Filename != "Travel.apkg" {
 		t.Fatalf("export: %v %v", r, err)
 	}
 	if _, ok := st.rows["gamma"]; !ok || st.rows["gamma"].Exported {
 		t.Error("gamma must stay new")
 	}
-	if _, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{CategoryId: "00000000-0000-4000-8000-999999999999"}); code(err) != codes.NotFound {
+	if _, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Group: "en", CategoryId: "00000000-0000-4000-8000-999999999999"}); code(err) != codes.NotFound {
 		t.Errorf("unknown category: %v", err)
 	}
-	r, err = exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Uncategorized: true})
+	r, err = exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Group: "en", Uncategorized: true})
 	if err != nil || r.WordCount != 1 {
 		t.Errorf("uncategorized: %v %v", r, err)
 	}
@@ -335,11 +335,11 @@ func TestExportByCategoryMarksOnlyThoseWords(t *testing.T) {
 func TestExportSelectedWords(t *testing.T) {
 	s, st := categoryService(t, "alpha", "beta", "gamma")
 	st.rows["alpha"] = func() store.SavedWord { w := st.rows["alpha"]; w.Exported = true; return w }()
-	r, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Words: []string{"alpha", "gamma", "ghost", "alpha"}, Scope: dictionaryv1.ExportScope_EXPORT_SCOPE_NEW})
+	r, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Group: "en", Words: []string{"alpha", "gamma", "ghost", "alpha"}, Scope: dictionaryv1.ExportScope_EXPORT_SCOPE_NEW})
 	if err != nil || r.WordCount != 2 || r.Filename != "My Words.apkg" {
 		t.Fatalf("selected: %v %v", r, err)
 	}
-	if _, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Words: []string{"ghost"}}); code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), CodeNoWords) {
+	if _, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Group: "en", Words: []string{"ghost"}}); code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), CodeNoWords) {
 		t.Errorf("only unknown words: %v", err)
 	}
 }
@@ -348,7 +348,7 @@ func TestExportAllIsUnchanged(t *testing.T) {
 	s, _ := categoryService(t, "alpha", "beta")
 	a := mustCategory(t, s, "A")
 	assign(t, s, a, "alpha")
-	r, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{})
+	r, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Group: "en"})
 	if err != nil || r.WordCount != 2 {
 		t.Errorf("all: %v %v", r, err)
 	}
@@ -358,17 +358,17 @@ func TestReviewQueueByCategory(t *testing.T) {
 	st := newFakeStore()
 	s := reviewService(st)
 	for _, w := range []string{"alpha", "beta", "gamma"} {
-		if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: w, Content: "c"}); err != nil {
+		if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: w, Content: "c"}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	a := mustCategory(t, s, "A")
 	assign(t, s, a, "alpha", "beta")
-	r, err := s.GetReviewQueue(userCtx(), &dictionaryv1.GetReviewQueueRequest{CategoryId: a})
+	r, err := s.GetReviewQueue(userCtx(), &dictionaryv1.GetReviewQueueRequest{Group: "en", CategoryId: a})
 	if err != nil || r.TotalCount != 2 || r.NewCount != 2 || len(r.Cards) != 2 {
 		t.Fatalf("A: %v %v", r, err)
 	}
-	r, _ = s.GetReviewQueue(userCtx(), &dictionaryv1.GetReviewQueueRequest{Uncategorized: true})
+	r, _ = s.GetReviewQueue(userCtx(), &dictionaryv1.GetReviewQueueRequest{Group: "en", Uncategorized: true})
 	if r.TotalCount != 1 || len(r.Cards) != 1 || r.Cards[0].Word != "gamma" {
 		t.Errorf("uncategorized: %v", r)
 	}
@@ -404,7 +404,7 @@ func TestListCategoriesCacheIsDroppedByWrites(t *testing.T) {
 	a := mustCategory(t, s, "A")
 	list := func() *dictionaryv1.ListCategoriesResponse {
 		t.Helper()
-		r, err := s.ListCategories(userCtx(), &dictionaryv1.ListCategoriesRequest{})
+		r, err := s.ListCategories(userCtx(), &dictionaryv1.ListCategoriesRequest{Group: "en"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -430,7 +430,7 @@ func TestListCategoriesCacheIsDroppedByWrites(t *testing.T) {
 func TestSyncExportRefusesALongList(t *testing.T) {
 	s, st := categoryService(t, "alpha", "beta", "gamma")
 	s.cfg.ExportSyncMax = 2
-	_, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{})
+	_, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Group: "en"})
 	if code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeExportUseJob) || !strings.Contains(err.Error(), "3 words") {
 		t.Fatalf("3 words, limit 2: %v", err)
 	}
@@ -440,7 +440,7 @@ func TestSyncExportRefusesALongList(t *testing.T) {
 		}
 	}
 	s.cfg.ExportSyncMax = 3
-	if r, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{}); err != nil || r.WordCount != 3 {
+	if r, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Group: "en"}); err != nil || r.WordCount != 3 {
 		t.Errorf("at the limit: %v %v", r, err)
 	}
 }
@@ -452,10 +452,10 @@ func TestBatchOfWordsIsBounded(t *testing.T) {
 	for i := range many {
 		many[i] = fmt.Sprintf("w%d", i)
 	}
-	if _, err := s.UpdateWordCategories(userCtx(), &dictionaryv1.UpdateWordCategoriesRequest{Words: many, AddCategoryIds: []string{a}}); code(err) != codes.InvalidArgument {
+	if _, err := s.UpdateWordCategories(userCtx(), &dictionaryv1.UpdateWordCategoriesRequest{Group: "en", Words: many, AddCategoryIds: []string{a}}); code(err) != codes.InvalidArgument {
 		t.Errorf("UpdateWordCategories with %d words: %v", len(many), err)
 	}
-	if _, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Words: many}); code(err) != codes.InvalidArgument {
+	if _, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Group: "en", Words: many}); code(err) != codes.InvalidArgument {
 		t.Errorf("export of %d selected words: %v", len(many), err)
 	}
 }
@@ -464,7 +464,7 @@ func TestCheckSavedWords(t *testing.T) {
 	s, _ := categoryService(t, "alpha", "beta")
 	a := mustCategory(t, s, "A")
 	assign(t, s, a, "alpha")
-	r, err := s.CheckSavedWords(userCtx(), &dictionaryv1.CheckSavedWordsRequest{Words: []string{" Beta ", "ALPHA", "ghost", "alpha", "not a word!!"}})
+	r, err := s.CheckSavedWords(userCtx(), &dictionaryv1.CheckSavedWordsRequest{Group: "en", Words: []string{" Beta ", "ALPHA", "ghost", "alpha", "not a word!!"}})
 	if err != nil || len(r.Words) != 2 {
 		t.Fatalf("check: %v %v", r, err)
 	}
@@ -475,7 +475,7 @@ func TestCheckSavedWords(t *testing.T) {
 	for i := range many {
 		many[i] = fmt.Sprintf("w%d", i)
 	}
-	if _, err := s.CheckSavedWords(userCtx(), &dictionaryv1.CheckSavedWordsRequest{Words: many}); code(err) != codes.InvalidArgument {
+	if _, err := s.CheckSavedWords(userCtx(), &dictionaryv1.CheckSavedWordsRequest{Group: "en", Words: many}); code(err) != codes.InvalidArgument {
 		t.Errorf("too many words: %v", err)
 	}
 }
@@ -485,12 +485,12 @@ func TestSyncExportLimitIsASystemSetting(t *testing.T) {
 	s, st := categoryService(t, "alpha", "beta", "gamma")
 	s.cfg.ExportSyncMax = 5
 	st.settings = map[string]json.RawMessage{"export_sync_max_words": json.RawMessage(`2`)}
-	_, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{})
+	_, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Group: "en"})
 	if code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeExportUseJob) || !strings.Contains(err.Error(), "at most 2") {
 		t.Fatalf("3 words, setting 2, configuration 5: %v", err)
 	}
 	st.settings["export_sync_max_words"] = json.RawMessage(`3`)
-	if r, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{}); err != nil || r.WordCount != 3 {
+	if r, err := exportWords(t, s, &dictionaryv1.ExportAnkiRequest{Group: "en"}); err != nil || r.WordCount != 3 {
 		t.Errorf("at the setting: %v %v", r, err)
 	}
 }
