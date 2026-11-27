@@ -48,7 +48,7 @@ func TestCategoryCRUDAndLimit(t *testing.T) {
 	if _, err := s.RenameCategory(ctx, user, "not-a-uuid", "x"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("rename unknown: %v", err)
 	}
-	res, err := s.ListCategories(ctx, user)
+	res, err := s.ListCategories(ctx, user, "en")
 	cats := res.List
 	if err != nil || len(cats) != 2 || cats[0].Name != "Cooking" || cats[1].ID != a {
 		t.Errorf("list: %v %v", cats, err)
@@ -67,17 +67,17 @@ func TestCategoriesOfAnotherUserAreNotUsable(t *testing.T) {
 	_, other := testStore(t)
 	foreign := mustCat(t, s, other, "Theirs")
 	saveAll(t, s, user, "alpha")
-	if _, err := s.SetWordCategories(ctx, user, []string{"alpha"}, []string{foreign}, nil); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SetWordCategories(ctx, user, "en", []string{"alpha"}, []string{foreign}, nil); !errors.Is(err, ErrNotFound) {
 		t.Errorf("assign foreign: %v", err)
 	}
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "beta"}, 100, testQuota, []string{foreign}); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "beta"}, 100, testQuota, []string{foreign}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("save with foreign: %v", err)
 	}
 	if err := s.DeleteCategory(ctx, user, foreign); !errors.Is(err, ErrNotFound) {
 		t.Errorf("delete foreign: %v", err)
 	}
 	// the failed save left no word behind
-	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{}); total != 1 {
+	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{Group: "en"}); total != 1 {
 		t.Errorf("total = %d", total)
 	}
 }
@@ -86,24 +86,24 @@ func TestResaveKeepsCategoriesAndFilters(t *testing.T) {
 	ctx := context.Background()
 	s, user := testStore(t)
 	a, b := mustCat(t, s, user, "A"), mustCat(t, s, user, "B")
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "alpha", Content: "1"}, 100, testQuota, []string{a}); err != nil {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "alpha", Content: "1"}, 100, testQuota, []string{a}); err != nil {
 		t.Fatal(err)
 	}
 	saveAll(t, s, user, "beta", "gamma")
-	if _, err := s.SetWordCategories(ctx, user, []string{"beta", "ghost"}, []string{a, b}, nil); err != nil {
+	if _, err := s.SetWordCategories(ctx, user, "en", []string{"beta", "ghost"}, []string{a, b}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := s.SetWordCategories(ctx, user, []string{"beta", "ghost"}, nil, []string{b}); n != 1 {
+	if n, _ := s.SetWordCategories(ctx, user, "en", []string{"beta", "ghost"}, nil, []string{b}); n != 1 {
 		t.Errorf("updated = %d (ghost is not in the list)", n)
 	}
 	// re-saving alpha with the card changed and another category adds, it never removes
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "alpha", Content: "2"}, 100, testQuota, []string{b}); err != nil {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "alpha", Content: "2"}, 100, testQuota, []string{b}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "alpha", Content: "3"}, 100, testQuota, nil); err != nil {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "alpha", Content: "3"}, 100, testQuota, nil); err != nil {
 		t.Fatal(err)
 	}
-	all, err := s.ListPending(ctx, user, time.Time{}, "", "", WordFilter{}, 10)
+	all, err := s.ListPending(ctx, user, time.Time{}, "", "", WordFilter{Group: "en"}, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,11 +116,11 @@ func TestResaveKeepsCategoriesAndFilters(t *testing.T) {
 		f    WordFilter
 		want []string
 	}{
-		"A":             {WordFilter{CategoryID: a}, []string{"alpha", "beta"}},
-		"B":             {WordFilter{CategoryID: b}, []string{"alpha"}},
-		"uncategorized": {WordFilter{Uncategorized: true}, []string{"gamma"}},
-		"unknown":       {WordFilter{CategoryID: "nope"}, nil},
-		"all":           {WordFilter{}, []string{"alpha", "beta", "gamma"}},
+		"A":             {WordFilter{Group: "en", CategoryID: a}, []string{"alpha", "beta"}},
+		"B":             {WordFilter{Group: "en", CategoryID: b}, []string{"alpha"}},
+		"uncategorized": {WordFilter{Group: "en", Uncategorized: true}, []string{"gamma"}},
+		"unknown":       {WordFilter{Group: "en", CategoryID: "nope"}, nil},
+		"all":           {WordFilter{Group: "en"}, []string{"alpha", "beta", "gamma"}},
 	} {
 		got, err := s.ListPending(ctx, user, time.Time{}, "", "", c.f, 10)
 		if err != nil || !slices.Equal(wordsOf(got), c.want) {
@@ -135,8 +135,8 @@ func TestResaveKeepsCategoriesAndFilters(t *testing.T) {
 		}
 	}
 	// the page keyset works together with the filter
-	p1, _ := s.ListPending(ctx, user, time.Time{}, "", "", WordFilter{CategoryID: a}, 1)
-	p2, _ := s.ListPending(ctx, user, p1[0].CreatedAt, p1[0].Word, "", WordFilter{CategoryID: a}, 5)
+	p1, _ := s.ListPending(ctx, user, time.Time{}, "", "", WordFilter{Group: "en", CategoryID: a}, 1)
+	p2, _ := s.ListPending(ctx, user, p1[0].CreatedAt, p1[0].Word, "", WordFilter{Group: "en", CategoryID: a}, 5)
 	if len(p1) != 1 || len(p2) != 1 || p1[0].Word == p2[0].Word {
 		t.Errorf("pages: %v %v", p1, p2)
 	}
@@ -146,10 +146,10 @@ func TestPendingOfSelectedWords(t *testing.T) {
 	ctx := context.Background()
 	s, user := testStore(t)
 	saveAll(t, s, user, "alpha", "beta", "gamma")
-	if _, err := s.MarkExported(ctx, user, []string{"alpha"}, false); err != nil {
+	if _, err := s.MarkExported(ctx, user, "en", []string{"alpha"}, false); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Pending(ctx, user, ScopeNew, WordFilter{}, []string{"alpha", "gamma", "ghost"}, 0)
+	got, err := s.Pending(ctx, user, ScopeNew, WordFilter{Group: "en"}, []string{"alpha", "gamma", "ghost"}, 0)
 	if err != nil || !slices.Equal(wordsOf(got), []string{"alpha", "gamma"}) {
 		t.Errorf("selected: %v %v", wordsOf(got), err)
 	}
@@ -160,15 +160,15 @@ func TestDeleteCategoryKeepsWordsAndDeleteWordCleansLinks(t *testing.T) {
 	s, user := testStore(t)
 	a := mustCat(t, s, user, "A")
 	saveAll(t, s, user, "alpha", "beta")
-	if _, err := s.SetWordCategories(ctx, user, []string{"alpha", "beta"}, []string{a}, nil); err != nil {
+	if _, err := s.SetWordCategories(ctx, user, "en", []string{"alpha", "beta"}, []string{a}, nil); err != nil {
 		t.Fatal(err)
 	}
-	res, _ := s.ListCategories(ctx, user)
+	res, _ := s.ListCategories(ctx, user, "en")
 	cats, uncat := res.List, res.UncatTotal
 	if cats[0].Total != 2 || uncat != 0 {
 		t.Errorf("counts: %v %d", cats, uncat)
 	}
-	if err := s.DeletePending(ctx, user, "alpha"); err != nil {
+	if err := s.DeletePending(ctx, user, "en", "alpha"); err != nil {
 		t.Fatal(err)
 	}
 	var links int
@@ -178,7 +178,7 @@ func TestDeleteCategoryKeepsWordsAndDeleteWordCleansLinks(t *testing.T) {
 	if err := s.DeleteCategory(ctx, user, a); err != nil {
 		t.Fatal(err)
 	}
-	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{Uncategorized: true}); total != 1 {
+	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{Group: "en", Uncategorized: true}); total != 1 {
 		t.Errorf("beta must stay, uncategorized now: %d", total)
 	}
 }
@@ -188,20 +188,20 @@ func TestExportOfACategoryMarksOnlyItsWords(t *testing.T) {
 	s, user := testStore(t)
 	a := mustCat(t, s, user, "A")
 	saveAll(t, s, user, "alpha", "beta", "gamma")
-	if _, err := s.SetWordCategories(ctx, user, []string{"alpha", "beta"}, []string{a}, nil); err != nil {
+	if _, err := s.SetWordCategories(ctx, user, "en", []string{"alpha", "beta"}, []string{a}, nil); err != nil {
 		t.Fatal(err)
 	}
-	pend, err := s.Pending(ctx, user, ScopeNew, WordFilter{CategoryID: a}, nil, 0)
+	pend, err := s.Pending(ctx, user, ScopeNew, WordFilter{Group: "en", CategoryID: a}, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MarkExported(ctx, user, []string{pend[0].Word, pend[1].Word}, false); err != nil {
+	if _, err := s.MarkExported(ctx, user, "en", []string{pend[0].Word, pend[1].Word}, false); err != nil {
 		t.Fatal(err)
 	}
-	if total, fresh, _, _ := s.CountPending(ctx, user, WordFilter{}); total != 3 || fresh != 1 {
+	if total, fresh, _, _ := s.CountPending(ctx, user, WordFilter{Group: "en"}); total != 3 || fresh != 1 {
 		t.Errorf("total=%d fresh=%d", total, fresh)
 	}
-	res, _ := s.ListCategories(ctx, user)
+	res, _ := s.ListCategories(ctx, user, "en")
 	cats, uncatNew := res.List, res.UncatNew
 	if cats[0].Total != 2 || cats[0].New != 0 || uncatNew != 1 {
 		t.Errorf("counts: %+v uncatNew=%d", cats, uncatNew)
@@ -214,13 +214,13 @@ func TestReviewByCategoryKeepsDailyLimitGlobal(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	a := mustCat(t, s, user, "A")
 	saveAll(t, s, user, "alpha", "beta", "gamma")
-	if _, err := s.SetWordCategories(ctx, user, []string{"alpha", "beta"}, []string{a}, nil); err != nil {
+	if _, err := s.SetWordCategories(ctx, user, "en", []string{"alpha", "beta"}, []string{a}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutReview(ctx, user, "gamma", now, srs.Good, grade(srs.Good, now)); err != nil { // uncategorized, reviewed
+	if _, err := s.PutReview(ctx, user, "en", "gamma", now, srs.Good, grade(srs.Good, now)); err != nil { // uncategorized, reviewed
 		t.Fatal(err)
 	}
-	f := WordFilter{CategoryID: a}
+	f := WordFilter{Group: "en", CategoryID: a}
 	cnt, err := s.ReviewCounts(ctx, user, now, f)
 	if err != nil || cnt.Total != 2 || cnt.New != 2 || cnt.Due != 0 {
 		t.Errorf("counts A: %+v %v", cnt, err)
@@ -229,16 +229,16 @@ func TestReviewByCategoryKeepsDailyLimitGlobal(t *testing.T) {
 	if err != nil || !slices.Equal(words(q), []string{"alpha", "beta"}) {
 		t.Errorf("queue A: %v %v", words(q), err)
 	}
-	cnt, _ = s.ReviewCounts(ctx, user, now, WordFilter{Uncategorized: true})
+	cnt, _ = s.ReviewCounts(ctx, user, now, WordFilter{Group: "en", Uncategorized: true})
 	if cnt.Total != 1 || cnt.New != 0 {
 		t.Errorf("counts uncategorized: %+v", cnt)
 	}
-	q, _ = s.ReviewQueue(ctx, user, now.Add(48*time.Hour), WordFilter{Uncategorized: true}, 10, 10, 10)
+	q, _ = s.ReviewQueue(ctx, user, now.Add(48*time.Hour), WordFilter{Group: "en", Uncategorized: true}, 10, 10, 10)
 	if !slices.Equal(words(q), []string{"gamma"}) {
 		t.Errorf("queue uncategorized: %v", words(q))
 	}
 	// the card reviewed in no category still counts against the limit of new words of the whole list
-	if n, _, err := s.ReviewToday(ctx, user, now); err != nil || n != 1 {
+	if n, _, err := s.ReviewToday(ctx, user, "en", now); err != nil || n != 1 {
 		t.Errorf("ReviewToday = %d %v", n, err)
 	}
 }
@@ -262,38 +262,38 @@ func TestCategorizedFlagFollowsLinks(t *testing.T) {
 	a, _ := s.CreateCategory(ctx, user, "A", 10)
 	b, _ := s.CreateCategory(ctx, user, "B", 10)
 	for _, w := range []string{"x", "y", "z"} {
-		if _, err := s.SaveWord(ctx, user, SavedWord{Word: w}, 100, testQuota, nil); err != nil {
+		if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: w}, 100, testQuota, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "w"}, 100, testQuota, []string{a.ID}); err != nil { // linked when saved
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "w"}, 100, testQuota, []string{a.ID}); err != nil { // linked when saved
 		t.Fatal(err)
 	}
 	categorizedOK(t, s, user)
-	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{Uncategorized: true}); total != 3 {
+	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{Group: "en", Uncategorized: true}); total != 3 {
 		t.Errorf("uncategorized = %d, want 3", total)
 	}
-	if _, err := s.SetWordCategories(ctx, user, []string{"x", "y"}, []string{a.ID, b.ID}, nil); err != nil {
+	if _, err := s.SetWordCategories(ctx, user, "en", []string{"x", "y"}, []string{a.ID, b.ID}, nil); err != nil {
 		t.Fatal(err)
 	}
 	categorizedOK(t, s, user)
 	// y leaves A but stays in B; x leaves both
-	if _, err := s.SetWordCategories(ctx, user, []string{"y"}, nil, []string{a.ID}); err != nil {
+	if _, err := s.SetWordCategories(ctx, user, "en", []string{"y"}, nil, []string{a.ID}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SetWordCategories(ctx, user, []string{"x"}, nil, []string{a.ID, b.ID}); err != nil {
+	if _, err := s.SetWordCategories(ctx, user, "en", []string{"x"}, nil, []string{a.ID, b.ID}); err != nil {
 		t.Fatal(err)
 	}
 	categorizedOK(t, s, user)
-	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{Uncategorized: true}); total != 2 { // x, z
+	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{Group: "en", Uncategorized: true}); total != 2 { // x, z
 		t.Errorf("uncategorized = %d, want 2", total)
 	}
 	// saving a word again keeps its categories
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "w", Content: "again"}, 100, testQuota, nil); err != nil {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "w", Content: "again"}, 100, testQuota, nil); err != nil {
 		t.Fatal(err)
 	}
 	categorizedOK(t, s, user)
-	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{Uncategorized: true}); total != 2 {
+	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{Group: "en", Uncategorized: true}); total != 2 {
 		t.Errorf("uncategorized after re-save = %d, want 2", total)
 	}
 	// deleting a category frees the words that were only in it, in batches
@@ -301,7 +301,7 @@ func TestCategorizedFlagFollowsLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	categorizedOK(t, s, user)
-	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{Uncategorized: true}); total != 3 { // x, y, z
+	if total, _, _, _ := s.CountPending(ctx, user, WordFilter{Group: "en", Uncategorized: true}); total != 3 { // x, y, z
 		t.Errorf("uncategorized after delete = %d, want 3", total)
 	}
 }
@@ -311,12 +311,12 @@ func TestDeleteCategoryInBatches(t *testing.T) {
 	s, user := testStore(t)
 	c, _ := s.CreateCategory(ctx, user, "Big", 10)
 	n := unlinkBatch + 3
-	if _, err := s.pool.Exec(ctx, `INSERT INTO dictionary_saved_words (user_id, word, content, categorized)
-		SELECT $1, 'w' || g, '', true FROM generate_series(1, $2) g`, user, n); err != nil {
+	if _, err := s.pool.Exec(ctx, `INSERT INTO dictionary_saved_words (user_id, grp, word, content, categorized)
+		SELECT $1, 'en', 'w' || g, '', true FROM generate_series(1, $2) g`, user, n); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO dictionary_word_categories (user_id, word, category_id)
-		SELECT $1, 'w' || g, $3::uuid FROM generate_series(1, $2) g`, user, n, c.ID); err != nil {
+	if _, err := s.pool.Exec(ctx, `INSERT INTO dictionary_word_categories (user_id, grp, word, category_id)
+		SELECT $1, 'en', 'w' || g, $3::uuid FROM generate_series(1, $2) g`, user, n, c.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.DeleteCategory(ctx, user, c.ID); err != nil {
@@ -337,12 +337,12 @@ func TestCountsAreCapped(t *testing.T) {
 	s, user := testStore(t)
 	c, _ := s.CreateCategory(ctx, user, "Big", 10)
 	n := countCap + 5
-	if _, err := s.pool.Exec(ctx, `INSERT INTO dictionary_saved_words (user_id, word, content, categorized)
-		SELECT $1, 'w' || g, '', true FROM generate_series(1, $2) g`, user, n); err != nil {
+	if _, err := s.pool.Exec(ctx, `INSERT INTO dictionary_saved_words (user_id, grp, word, content, categorized)
+		SELECT $1, 'en', 'w' || g, '', true FROM generate_series(1, $2) g`, user, n); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO dictionary_word_categories (user_id, word, category_id)
-		SELECT $1, 'w' || g, $3::uuid FROM generate_series(1, $2) g`, user, n, c.ID); err != nil {
+	if _, err := s.pool.Exec(ctx, `INSERT INTO dictionary_word_categories (user_id, grp, word, category_id)
+		SELECT $1, 'en', 'w' || g, $3::uuid FROM generate_series(1, $2) g`, user, n, c.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.pool.Exec(ctx, `INSERT INTO dictionary_user_stats (user_id, listed) VALUES ($1, $2)
@@ -350,19 +350,19 @@ func TestCountsAreCapped(t *testing.T) {
 		t.Fatal(err)
 	}
 	// no filter: the total is exact (the counter), the new count is capped
-	total, fresh, capped, err := s.CountPending(ctx, user, WordFilter{})
+	total, fresh, capped, err := s.CountPending(ctx, user, WordFilter{Group: "en"})
 	if err != nil || total != n || fresh != countCap || !capped {
 		t.Errorf("unfiltered: total=%d fresh=%d capped=%v err=%v", total, fresh, capped, err)
 	}
-	total, fresh, capped, err = s.CountPending(ctx, user, WordFilter{CategoryID: c.ID})
+	total, fresh, capped, err = s.CountPending(ctx, user, WordFilter{Group: "en", CategoryID: c.ID})
 	if err != nil || total != categoryCountCap || fresh != categoryCountCap || !capped {
 		t.Errorf("category: total=%d fresh=%d capped=%v err=%v", total, fresh, capped, err)
 	}
-	res, err := s.ListCategories(ctx, user)
+	res, err := s.ListCategories(ctx, user, "en")
 	if err != nil || !res.Capped || res.List[0].Total != categoryCountCap || res.List[0].New != categoryCountCap {
 		t.Errorf("ListCategories: %+v %v", res, err)
 	}
-	total, _, capped, _ = s.CountPending(ctx, user, WordFilter{Uncategorized: true})
+	total, _, capped, _ = s.CountPending(ctx, user, WordFilter{Group: "en", Uncategorized: true})
 	if total != 0 || capped {
 		t.Errorf("uncategorized: total=%d capped=%v", total, capped)
 	}
@@ -387,23 +387,23 @@ func TestCategoryPagesFollowTheWords(t *testing.T) {
 	s, user := testStore(t)
 	a, _ := s.CreateCategory(ctx, user, "A", 10)
 	for _, w := range []string{"one", "two", "three"} {
-		if _, err := s.SaveWord(ctx, user, SavedWord{Word: w}, 100, testQuota, []string{a.ID}); err != nil {
+		if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: w}, 100, testQuota, []string{a.ID}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "four"}, 100, testQuota, nil); err != nil {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "four"}, 100, testQuota, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SetWordCategories(ctx, user, []string{"four"}, []string{a.ID}, nil); err != nil {
+	if _, err := s.SetWordCategories(ctx, user, "en", []string{"four"}, []string{a.ID}, nil); err != nil {
 		t.Fatal(err)
 	}
 	linksOK(t, s, user)
 	// saving a word again makes it the newest of the list and of its category
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "one", Content: "again"}, 100, testQuota, nil); err != nil {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "one", Content: "again"}, 100, testQuota, nil); err != nil {
 		t.Fatal(err)
 	}
 	linksOK(t, s, user)
-	f := WordFilter{CategoryID: a.ID}
+	f := WordFilter{Group: "en", CategoryID: a.ID}
 	page1, err := s.ListPending(ctx, user, time.Time{}, "", "", f, 2)
 	if err != nil || len(page1) != 2 || page1[0].Word != "one" || page1[1].Word != "four" {
 		t.Fatalf("page 1: %+v %v", page1, err)
@@ -428,7 +428,7 @@ func TestCategoryPagesFollowTheWords(t *testing.T) {
 		t.Errorf("CountExportable: %d %v", n, err)
 	}
 	// a word that left the list is not in the page, though its links stay
-	if _, err := s.MarkExported(ctx, user, []string{"two"}, true); err != nil {
+	if _, err := s.MarkExported(ctx, user, "en", []string{"two"}, true); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := s.ListPending(ctx, user, time.Time{}, "", "", f, 10); len(got) != 3 {
@@ -441,24 +441,24 @@ func TestSavedByNames(t *testing.T) {
 	s, user := testStore(t)
 	a, _ := s.CreateCategory(ctx, user, "A", 10)
 	for _, w := range []string{"alpha", "beta", "gamma"} {
-		if _, err := s.SaveWord(ctx, user, SavedWord{Word: w}, 100, testQuota, nil); err != nil {
+		if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: w}, 100, testQuota, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := s.SetWordCategories(ctx, user, []string{"alpha"}, []string{a.ID}, nil); err != nil {
+	if _, err := s.SetWordCategories(ctx, user, "en", []string{"alpha"}, []string{a.ID}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MarkExported(ctx, user, []string{"gamma"}, true); err != nil { // left the list
+	if _, err := s.MarkExported(ctx, user, "en", []string{"gamma"}, true); err != nil { // left the list
 		t.Fatal(err)
 	}
-	got, err := s.SavedByNames(ctx, user, []string{"alpha", "beta", "gamma", "ghost"})
+	got, err := s.SavedByNames(ctx, user, "en", []string{"alpha", "beta", "gamma", "ghost"})
 	if err != nil || len(got) != 2 || len(got["alpha"]) != 1 || got["alpha"][0] != a.ID {
 		t.Fatalf("SavedByNames: %v %v", got, err)
 	}
 	if ids, ok := got["beta"]; !ok || len(ids) != 0 {
 		t.Errorf("beta: %v %v", ids, ok)
 	}
-	if got, err := s.SavedByNames(ctx, user, nil); err != nil || len(got) != 0 {
+	if got, err := s.SavedByNames(ctx, user, "en", nil); err != nil || len(got) != 0 {
 		t.Errorf("no words: %v %v", got, err)
 	}
 }

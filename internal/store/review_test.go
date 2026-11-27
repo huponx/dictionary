@@ -13,7 +13,7 @@ import (
 func saveAll(t *testing.T, s *Store, user string, words ...string) {
 	t.Helper()
 	for _, w := range words {
-		if _, err := s.SaveWord(context.Background(), user, SavedWord{Word: w, Content: "<p>" + w + "</p>"}, 100, testQuota, nil); err != nil {
+		if _, err := s.SaveWord(context.Background(), user, SavedWord{Group: "en", Word: w, Content: "<p>" + w + "</p>"}, 100, testQuota, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -38,13 +38,13 @@ func TestReviewQueueDueThenNewAndExcludesRemoved(t *testing.T) {
 	saveAll(t, s, user, "a", "b", "c", "d")
 
 	// c and d are reviewed: c comes due before d, then both are in the future after one more grade of d
-	if _, err := s.PutReview(ctx, user, "c", now.Add(-48*time.Hour), srs.Good, grade(srs.Good, now.Add(-48*time.Hour))); err != nil { // due -24h
+	if _, err := s.PutReview(ctx, user, "en", "c", now.Add(-48*time.Hour), srs.Good, grade(srs.Good, now.Add(-48*time.Hour))); err != nil { // due -24h
 		t.Fatal(err)
 	}
-	if _, err := s.PutReview(ctx, user, "d", now.Add(-48*time.Hour), srs.Again, grade(srs.Again, now.Add(-48*time.Hour))); err != nil { // due -47h50m
+	if _, err := s.PutReview(ctx, user, "en", "d", now.Add(-48*time.Hour), srs.Again, grade(srs.Again, now.Add(-48*time.Hour))); err != nil { // due -47h50m
 		t.Fatal(err)
 	}
-	q, err := s.ReviewQueue(ctx, user, now, WordFilter{}, 10, 10, 10)
+	q, err := s.ReviewQueue(ctx, user, now, WordFilter{Group: "en"}, 10, 10, 10)
 	if err != nil || len(q) != 4 || words(q)[0] != "d" || words(q)[1] != "c" || !q[2].IsNew || !q[3].IsNew || q[0].IsNew {
 		t.Fatalf("%v %v", words(q), err)
 	}
@@ -52,63 +52,63 @@ func TestReviewQueueDueThenNewAndExcludesRemoved(t *testing.T) {
 		t.Fatalf("%+v %+v", q[0].State, q[1].State)
 	}
 	// limit and the allowance of new words
-	if q, _ = s.ReviewQueue(ctx, user, now, WordFilter{}, 3, 3, 10); len(q) != 3 {
+	if q, _ = s.ReviewQueue(ctx, user, now, WordFilter{Group: "en"}, 3, 3, 10); len(q) != 3 {
 		t.Fatalf("%v", words(q))
 	}
-	if q, _ = s.ReviewQueue(ctx, user, now, WordFilter{}, 10, 10, 1); len(q) != 3 || words(q)[2] != "a" {
+	if q, _ = s.ReviewQueue(ctx, user, now, WordFilter{Group: "en"}, 10, 10, 1); len(q) != 3 || words(q)[2] != "a" {
 		t.Fatalf("%v", words(q))
 	}
-	if q, _ = s.ReviewQueue(ctx, user, now, WordFilter{}, 10, 10, 0); len(q) != 2 {
+	if q, _ = s.ReviewQueue(ctx, user, now, WordFilter{Group: "en"}, 10, 10, 0); len(q) != 2 {
 		t.Fatalf("%v", words(q))
 	}
 	// the allowance of due cards does not take the new words' place
-	if q, _ = s.ReviewQueue(ctx, user, now, WordFilter{}, 10, 1, 10); len(q) != 3 || words(q)[0] != "d" || !q[1].IsNew {
+	if q, _ = s.ReviewQueue(ctx, user, now, WordFilter{Group: "en"}, 10, 1, 10); len(q) != 3 || words(q)[0] != "d" || !q[1].IsNew {
 		t.Fatalf("%v", words(q))
 	}
-	if q, _ = s.ReviewQueue(ctx, user, now, WordFilter{}, 10, 0, 10); len(q) != 2 || !q[0].IsNew || !q[1].IsNew {
+	if q, _ = s.ReviewQueue(ctx, user, now, WordFilter{Group: "en"}, 10, 0, 10); len(q) != 2 || !q[0].IsNew || !q[1].IsNew {
 		t.Fatalf("%v", words(q))
 	}
-	cnt, err := s.ReviewCounts(ctx, user, now, WordFilter{})
+	cnt, err := s.ReviewCounts(ctx, user, now, WordFilter{Group: "en"})
 	if err != nil || cnt.Total != 4 || cnt.Due != 1 || cnt.Learning != 1 || cnt.New != 2 || !cnt.Next.IsZero() {
 		t.Fatalf("%+v %v", cnt, err)
 	}
 
 	// a word that left the list is not reviewed, counted or scheduled
-	if _, err := s.MarkExported(ctx, user, []string{"a", "c"}, true); err != nil {
+	if _, err := s.MarkExported(ctx, user, "en", []string{"a", "c"}, true); err != nil {
 		t.Fatal(err)
 	}
-	q, _ = s.ReviewQueue(ctx, user, now, WordFilter{}, 10, 10, 10)
+	q, _ = s.ReviewQueue(ctx, user, now, WordFilter{Group: "en"}, 10, 10, 10)
 	if got := words(q); len(got) != 2 || got[0] != "d" || got[1] != "b" {
 		t.Fatalf("%v", got)
 	}
-	if cnt, _ = s.ReviewCounts(ctx, user, now, WordFilter{}); cnt.Total != 2 || cnt.Due != 0 || cnt.Learning != 1 || cnt.New != 1 {
+	if cnt, _ = s.ReviewCounts(ctx, user, now, WordFilter{Group: "en"}); cnt.Total != 2 || cnt.Due != 0 || cnt.Learning != 1 || cnt.New != 1 {
 		t.Fatalf("%+v", cnt)
 	}
-	if _, err := s.PutReview(ctx, user, "a", now, srs.Good, grade(srs.Good, now)); !errors.Is(err, ErrNotFound) {
+	if _, err := s.PutReview(ctx, user, "en", "a", now, srs.Good, grade(srs.Good, now)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("a removed word: %v", err)
 	}
-	if _, err := s.PutReview(ctx, user, "ghost", now, srs.Good, grade(srs.Good, now)); !errors.Is(err, ErrNotFound) {
+	if _, err := s.PutReview(ctx, user, "en", "ghost", now, srs.Good, grade(srs.Good, now)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("an unknown word: %v", err)
 	}
 
 	// next due
-	if _, err := s.PutReview(ctx, user, "b", now, srs.Good, grade(srs.Good, now)); err != nil {
+	if _, err := s.PutReview(ctx, user, "en", "b", now, srs.Good, grade(srs.Good, now)); err != nil {
 		t.Fatal(err)
 	}
-	cnt, _ = s.ReviewCounts(ctx, user, now, WordFilter{})
+	cnt, _ = s.ReviewCounts(ctx, user, now, WordFilter{Group: "en"})
 	if want := now.Add(24 * time.Hour); !cnt.Next.Equal(want) {
 		t.Fatalf("next %v, want %v", cnt.Next, want)
 	}
 
 	// a card graded Again again is learning: counted apart from the review cards once its step is due
-	if _, err := s.PutReview(ctx, user, "b", now, srs.Again, grade(srs.Again, now)); err != nil {
+	if _, err := s.PutReview(ctx, user, "en", "b", now, srs.Again, grade(srs.Again, now)); err != nil {
 		t.Fatal(err)
 	}
 	soon := now.Add(11 * time.Minute)
-	if cnt, _ = s.ReviewCounts(ctx, user, soon, WordFilter{}); cnt.Due != 0 || cnt.Learning != 2 || cnt.New != 0 {
+	if cnt, _ = s.ReviewCounts(ctx, user, soon, WordFilter{Group: "en"}); cnt.Due != 0 || cnt.Learning != 2 || cnt.New != 0 {
 		t.Fatalf("%+v", cnt)
 	}
-	if cnt, _ = s.ReviewCounts(ctx, user, now, WordFilter{}); cnt.Learning != 1 {
+	if cnt, _ = s.ReviewCounts(ctx, user, now, WordFilter{Group: "en"}); cnt.Learning != 1 {
 		t.Fatalf("b is not due yet: %+v", cnt)
 	}
 }
@@ -119,12 +119,12 @@ func TestReviewStateFollowsTheWord(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	saveAll(t, s, user, "keep", "gone")
 	for _, w := range []string{"keep", "gone"} {
-		if _, err := s.PutReview(ctx, user, w, now, srs.Good, grade(srs.Good, now)); err != nil {
+		if _, err := s.PutReview(ctx, user, "en", w, now, srs.Good, grade(srs.Good, now)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// editing the card keeps the schedule
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "keep", Content: "<p>edited</p>"}, 100, testQuota, nil); err != nil {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "keep", Content: "<p>edited</p>"}, 100, testQuota, nil); err != nil {
 		t.Fatal(err)
 	}
 	var n int
@@ -132,10 +132,10 @@ func TestReviewStateFollowsTheWord(t *testing.T) {
 		t.Fatalf("schedule after an edit: %d %v", n, err)
 	}
 	// deleting the word (by hand, or by the cleanup after the retention) takes the schedule along
-	if err := s.DeletePending(ctx, user, "gone"); err != nil {
+	if err := s.DeletePending(ctx, user, "en", "gone"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MarkExported(ctx, user, []string{"keep"}, true); err != nil {
+	if _, err := s.MarkExported(ctx, user, "en", []string{"keep"}, true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.DeleteRemovedBefore(ctx, time.Now().Add(time.Minute), 100); err != nil {
@@ -151,20 +151,20 @@ func TestNewToday(t *testing.T) {
 	s, user := testStore(t)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	saveAll(t, s, user, "a", "b", "c")
-	if _, err := s.PutReview(ctx, user, "a", now.Add(-25*time.Hour), srs.Good, grade(srs.Good, now)); err != nil {
+	if _, err := s.PutReview(ctx, user, "en", "a", now.Add(-25*time.Hour), srs.Good, grade(srs.Good, now)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutReview(ctx, user, "b", now.Add(-23*time.Hour), srs.Good, grade(srs.Good, now)); err != nil {
+	if _, err := s.PutReview(ctx, user, "en", "b", now.Add(-23*time.Hour), srs.Good, grade(srs.Good, now)); err != nil {
 		t.Fatal(err)
 	}
 	// grading b again is not a first review
-	if _, err := s.PutReview(ctx, user, "b", now, srs.Good, grade(srs.Good, now)); err != nil {
+	if _, err := s.PutReview(ctx, user, "en", "b", now, srs.Good, grade(srs.Good, now)); err != nil {
 		t.Fatal(err)
 	}
-	if n, _, err := s.ReviewToday(ctx, user, now); err != nil || n != 1 {
+	if n, _, err := s.ReviewToday(ctx, user, "en", now); err != nil || n != 1 {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
-	if n, _, _ := s.ReviewToday(ctx, user, now.Add(2*time.Hour)); n != 0 {
+	if n, _, _ := s.ReviewToday(ctx, user, "en", now.Add(2*time.Hour)); n != 0 {
 		t.Fatalf("after the window: %d", n)
 	}
 }
@@ -180,18 +180,18 @@ func TestReviewsToday(t *testing.T) {
 		word string
 		at   time.Time
 	}{{"a", now.Add(-25 * time.Hour)}, {"a", now}, {"b", now.Add(-23 * time.Hour)}, {"b", now}, {"c", now.Add(-30 * time.Hour)}} {
-		if _, err := s.PutReview(ctx, user, p.word, p.at, srs.Good, grade(srs.Good, p.at)); err != nil {
+		if _, err := s.PutReview(ctx, user, "en", p.word, p.at, srs.Good, grade(srs.Good, p.at)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, n, err := s.ReviewToday(ctx, user, now); err != nil || n != 1 {
+	if _, n, err := s.ReviewToday(ctx, user, "en", now); err != nil || n != 1 {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
 	// a left the list
-	if _, err := s.MarkExported(ctx, user, []string{"a"}, true); err != nil {
+	if _, err := s.MarkExported(ctx, user, "en", []string{"a"}, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, n, _ := s.ReviewToday(ctx, user, now); n != 0 {
+	if _, n, _ := s.ReviewToday(ctx, user, "en", now); n != 0 {
 		t.Fatalf("removed word counted: %d", n)
 	}
 }
@@ -207,7 +207,7 @@ func TestPutReviewParallelGradesApplyInTurn(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := s.PutReview(ctx, user, "w", now, g, grade(g, now))
+			_, err := s.PutReview(ctx, user, "en", "w", now, g, grade(g, now))
 			errs <- err
 		}()
 	}
@@ -224,10 +224,10 @@ func TestPutReviewParallelGradesApplyInTurn(t *testing.T) {
 		t.Fatalf("rows=%d learning=%v err=%v", rows, learning, err)
 	}
 	// both applied one after the other on the same row: after Good then Good the second sees the first
-	if _, err := s.PutReview(ctx, user, "w", now, srs.Good, grade(srs.Good, now)); err != nil {
+	if _, err := s.PutReview(ctx, user, "en", "w", now, srs.Good, grade(srs.Good, now)); err != nil {
 		t.Fatal(err)
 	}
-	st, err := s.PutReview(ctx, user, "w", now, srs.Good, grade(srs.Good, now))
+	st, err := s.PutReview(ctx, user, "en", "w", now, srs.Good, grade(srs.Good, now))
 	if err != nil || st.IntervalDays != 3 {
 		t.Fatalf("%+v %v", st, err)
 	}
@@ -273,13 +273,13 @@ func TestListPendingCarriesReviewState(t *testing.T) {
 	s, user := testStore(t)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	saveAll(t, s, user, "fresh", "learn", "graded")
-	if _, err := s.PutReview(ctx, user, "learn", now, srs.Again, grade(srs.Again, now)); err != nil {
+	if _, err := s.PutReview(ctx, user, "en", "learn", now, srs.Again, grade(srs.Again, now)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutReview(ctx, user, "graded", now, srs.Good, grade(srs.Good, now)); err != nil {
+	if _, err := s.PutReview(ctx, user, "en", "graded", now, srs.Good, grade(srs.Good, now)); err != nil {
 		t.Fatal(err)
 	}
-	list, err := s.ListPending(ctx, user, time.Time{}, "", "", WordFilter{}, 10)
+	list, err := s.ListPending(ctx, user, time.Time{}, "", "", WordFilter{Group: "en"}, 10)
 	if err != nil || len(list) != 3 {
 		t.Fatalf("%v %v", list, err)
 	}
@@ -312,13 +312,13 @@ func TestReviewStartedFlagAndNewOrder(t *testing.T) {
 	if started("a") {
 		t.Fatal("a new word is started")
 	}
-	if _, err := s.PutReview(ctx, user, "a", now, srs.Good, grade(srs.Good, now)); err != nil {
+	if _, err := s.PutReview(ctx, user, "en", "a", now, srs.Good, grade(srs.Good, now)); err != nil {
 		t.Fatal(err)
 	}
 	if !started("a") || started("b") {
 		t.Fatal("flag not set on the graded word only")
 	}
-	q, err := s.ReviewQueue(ctx, user, now, WordFilter{}, 10, 10, 10)
+	q, err := s.ReviewQueue(ctx, user, now, WordFilter{Group: "en"}, 10, 10, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,14 +326,14 @@ func TestReviewStartedFlagAndNewOrder(t *testing.T) {
 		t.Fatalf("new cards: %v", got)
 	}
 	// export and save again: the review state and the flag stay with the word
-	if _, err := s.MarkExported(ctx, user, []string{"a"}, true); err != nil {
+	if _, err := s.MarkExported(ctx, user, "en", []string{"a"}, true); err != nil {
 		t.Fatal(err)
 	}
 	saveAll(t, s, user, "a")
 	if !started("a") {
 		t.Fatal("flag lost on save again")
 	}
-	if cnt, _ := s.ReviewCounts(ctx, user, now, WordFilter{}); cnt.New != 2 || cnt.Total != 3 || cnt.Capped {
+	if cnt, _ := s.ReviewCounts(ctx, user, now, WordFilter{Group: "en"}); cnt.New != 2 || cnt.Total != 3 || cnt.Capped {
 		t.Fatalf("%+v", cnt)
 	}
 }
@@ -349,7 +349,7 @@ func TestPutReviewLogsEachGradeAndStoresFSRSMemory(t *testing.T) {
 		at time.Time
 		g  srs.Grade
 	}{{t1, srs.Good}, {t2, srs.Again}} {
-		if _, err := s.PutReview(ctx, user, "w", p.at, p.g, func(c srs.State) srs.State { return sc.Next(c, p.g, p.at) }); err != nil {
+		if _, err := s.PutReview(ctx, user, "en", "w", p.at, p.g, func(c srs.State) srs.State { return sc.Next(c, p.g, p.at) }); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -380,11 +380,11 @@ func TestReviewCountsAreCapped(t *testing.T) {
 	ctx := context.Background()
 	s, user := testStore(t)
 	now := time.Now().UTC()
-	if _, err := s.pool.Exec(ctx, `INSERT INTO dictionary_saved_words (user_id, word, content)
-		SELECT $1, 'w' || g, '' FROM generate_series(1, $2) g`, user, reviewCountCap+5); err != nil {
+	if _, err := s.pool.Exec(ctx, `INSERT INTO dictionary_saved_words (user_id, grp, word, content)
+		SELECT $1, 'en', 'w' || g, '' FROM generate_series(1, $2) g`, user, reviewCountCap+5); err != nil {
 		t.Skipf("bulk insert: %v", err)
 	}
-	cnt, err := s.ReviewCounts(ctx, user, now, WordFilter{})
+	cnt, err := s.ReviewCounts(ctx, user, now, WordFilter{Group: "en"})
 	if err != nil || !cnt.Capped || cnt.Total != reviewCountCap || cnt.New != reviewCountCap {
 		t.Fatalf("%+v %v", cnt, err)
 	}

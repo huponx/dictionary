@@ -14,8 +14,8 @@ import (
 
 func saveN(t *testing.T, s *Store, user string, n int) {
 	t.Helper()
-	if _, err := s.pool.Exec(context.Background(), `INSERT INTO dictionary_saved_words (user_id, word, content, created_at)
-		SELECT $1, 'w' || lpad(g::text, 6, '0'), '', now() - make_interval(secs => $2 - g) FROM generate_series(1, $2) g`, user, n); err != nil {
+	if _, err := s.pool.Exec(context.Background(), `INSERT INTO dictionary_saved_words (user_id, grp, word, content, created_at)
+		SELECT $1, 'en', 'w' || lpad(g::text, 6, '0'), '', now() - make_interval(secs => $2 - g) FROM generate_series(1, $2) g`, user, n); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.pool.Exec(context.Background(), `INSERT INTO dictionary_user_stats (user_id, listed) VALUES ($1, $2)
@@ -31,7 +31,7 @@ func TestPendingPageKeyset(t *testing.T) {
 	var got []string
 	var after SavedWord
 	for {
-		page, err := s.PendingPage(ctx, user, ScopeNew, WordFilter{}, after.CreatedAt, after.Word, 3)
+		page, err := s.PendingPage(ctx, user, ScopeNew, WordFilter{Group: "en"}, after.CreatedAt, after.Word, 3)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -46,7 +46,7 @@ func TestPendingPageKeyset(t *testing.T) {
 	if len(got) != 7 || got[0] != "w000001" || got[6] != "w000007" {
 		t.Errorf("pages (oldest first): %v", got)
 	}
-	if n, err := s.CountExportable(ctx, user, ScopeNew, WordFilter{}); err != nil || n != 7 {
+	if n, err := s.CountExportable(ctx, user, ScopeNew, WordFilter{Group: "en"}); err != nil || n != 7 {
 		t.Errorf("CountExportable: %d %v", n, err)
 	}
 }
@@ -62,7 +62,7 @@ func TestExportJobLifecycle(t *testing.T) {
 	if _, err := s.pool.Exec(ctx, `UPDATE dictionary_user_stats SET content_bytes = 50 WHERE user_id = $1`, user); err != nil {
 		t.Fatal(err)
 	}
-	p := ExportParams{DeckName: "D", Remove: true}
+	p := ExportParams{Group: "en", DeckName: "D", Remove: true}
 	job, err := s.CreateExportJob(ctx, user, p, time.Hour)
 	if err != nil || job.Status != JobQueued {
 		t.Fatalf("create: %+v %v", job, err)
@@ -89,7 +89,7 @@ func TestExportJobLifecycle(t *testing.T) {
 	if err := s.SetExportTotal(ctx, claimed.ID, claimed.LeaseID, 5); err != nil {
 		t.Fatal(err)
 	}
-	words, _ := s.PendingPage(ctx, user, ScopeNew, WordFilter{}, time.Time{}, "", 3)
+	words, _ := s.PendingPage(ctx, user, ScopeNew, WordFilter{Group: "en"}, time.Time{}, "", 3)
 	keys := []string{words[0].Word, words[1].Word, words[2].Word}
 	part := ExportPart{N: 1, Filename: "D (part 1).apkg", FileID: uuid.NewString(), WordCount: 3, Size: 10}
 	if err := s.AddExportPart(ctx, *claimed, claimed.LeaseID, part, keys, words[2]); err != nil {
@@ -129,7 +129,7 @@ func TestExportJobLifecycle(t *testing.T) {
 func TestExportJobTakenOverAfterTheLeaseEnds(t *testing.T) {
 	ctx := context.Background()
 	s, user := testStore(t)
-	job, err := s.CreateExportJob(ctx, user, ExportParams{DeckName: "D"}, time.Hour)
+	job, err := s.CreateExportJob(ctx, user, ExportParams{Group: "en", DeckName: "D"}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestExportJobTakenOverAfterTheLeaseEnds(t *testing.T) {
 func TestExportJobCancel(t *testing.T) {
 	ctx := context.Background()
 	s, user := testStore(t)
-	job, _ := s.CreateExportJob(ctx, user, ExportParams{}, time.Hour)
+	job, _ := s.CreateExportJob(ctx, user, ExportParams{Group: "en"}, time.Hour)
 	c, err := s.CancelExportJob(ctx, user, job.ID, time.Hour)
 	if err != nil || c.Status != JobCancelled {
 		t.Fatalf("cancel: %+v %v", c, err)
@@ -182,7 +182,7 @@ func TestExportJobCancel(t *testing.T) {
 func TestExportPartTokenAndExpiry(t *testing.T) {
 	ctx := context.Background()
 	s, user := testStore(t)
-	job, _ := s.CreateExportJob(ctx, user, ExportParams{}, time.Hour)
+	job, _ := s.CreateExportJob(ctx, user, ExportParams{Group: "en"}, time.Hour)
 	if _, err := s.pool.Exec(ctx, `UPDATE dictionary_export_jobs SET status = 'done' WHERE id = $1`, job.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestExportBuildingProgress(t *testing.T) {
 	ctx := context.Background()
 	s, user := testStore(t)
 	saveN(t, s, user, 3)
-	job, err := s.CreateExportJob(ctx, user, ExportParams{DeckName: "D"}, time.Hour)
+	job, err := s.CreateExportJob(ctx, user, ExportParams{Group: "en", DeckName: "D"}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestExportBuildingProgress(t *testing.T) {
 		t.Errorf("another lease: building = %d, %v", reading(), err)
 	}
 	// recording the part resets it, and so does the end of the job
-	words, _ := s.PendingPage(ctx, user, ScopeNew, WordFilter{}, time.Time{}, "", 2)
+	words, _ := s.PendingPage(ctx, user, ScopeNew, WordFilter{Group: "en"}, time.Time{}, "", 2)
 	part := ExportPart{N: 1, Filename: "p.apkg", FileID: uuid.NewString(), WordCount: 2, Size: 1}
 	if err := s.AddExportPart(ctx, *claimed, claimed.LeaseID, part, []string{words[0].Word, words[1].Word}, words[1]); err != nil {
 		t.Fatal(err)
@@ -281,7 +281,7 @@ func TestExistingExportFileIDs(t *testing.T) {
 	ctx := context.Background()
 	s, user := testStore(t)
 	saveN(t, s, user, 2)
-	job, err := s.CreateExportJob(ctx, user, ExportParams{DeckName: "D"}, time.Hour)
+	job, err := s.CreateExportJob(ctx, user, ExportParams{Group: "en", DeckName: "D"}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

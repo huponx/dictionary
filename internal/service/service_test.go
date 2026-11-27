@@ -33,36 +33,12 @@ func userCtx() context.Context {
 
 func code(err error) codes.Code { return status.Code(err) }
 
-// Every RPC has an entry in Permissions and no entry is left over (the server is deny by default).
-func TestEveryRPCHasAPermission(t *testing.T) {
-	seen := map[string]bool{}
-	for _, m := range dictionaryv1.DictionaryService_ServiceDesc.Methods {
-		full := "/" + dictionaryv1.DictionaryService_ServiceDesc.ServiceName + "/" + m.MethodName
-		seen[full] = true
-		if Permissions[full] == "" {
-			t.Errorf("%s has no entry in Permissions", full)
-		}
-	}
-	for _, m := range dictionaryv1.DictionaryService_ServiceDesc.Streams {
-		full := "/" + dictionaryv1.DictionaryService_ServiceDesc.ServiceName + "/" + m.StreamName
-		seen[full] = true
-		if Permissions[full] == "" {
-			t.Errorf("%s has no entry in Permissions", full)
-		}
-	}
-	for full := range Permissions {
-		if !seen[full] {
-			t.Errorf("Permissions has %s, which is not an RPC of DictionaryService", full)
-		}
-	}
-}
-
 type fakeLooker struct {
 	words map[string]*lookup.Word
 	err   error
 }
 
-func (f fakeLooker) Lookup(_ context.Context, _ lookup.Dictionary, w string) (*lookup.Word, error) {
+func (f fakeLooker) Lookup(_ context.Context, _ string, w string) (*lookup.Word, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -76,7 +52,7 @@ func (f fakeLooker) Lookup(_ context.Context, _ lookup.Dictionary, w string) (*l
 	return nil, lookup.ErrNotFound
 }
 
-func (f fakeLooker) LookupMany(ctx context.Context, d lookup.Dictionary, words []string) ([]*lookup.Word, []string, error) {
+func (f fakeLooker) LookupMany(ctx context.Context, d string, words []string) ([]*lookup.Word, []string, error) {
 	var found []*lookup.Word
 	var nf []string
 	for _, w := range words {
@@ -117,6 +93,8 @@ type fakeStore struct {
 	wordCats   map[string]map[string]bool // category ids by word
 	quotas     store.Quotas               // the own limits of the user
 	unknown    bool                       // GetStorageUsage: there is no such user
+	drifted    *store.Counters            // RecomputeUserCounters: the wrong counters it reports as the old ones
+	groups     map[string]*fakeStore      // the words of the groups other than "en", see fake_groups_test.go
 }
 
 func (f *fakeStore) Settings(context.Context) (map[string]json.RawMessage, error) {
@@ -171,7 +149,20 @@ func (f *fakeStore) SetStorageQuota(_ context.Context, _ string, q store.Quotas)
 	return nil
 }
 
-func (f *fakeStore) SaveWord(_ context.Context, user string, w store.SavedWord, max int, contentQuota int64, categoryIDs []string) (int, error) {
+func (f *fakeStore) RecomputeUserCounters(ctx context.Context, user string) (was, now store.Counters, err error) {
+	u, err := f.GetStorageUsage(ctx, user)
+	if err != nil {
+		return was, now, err
+	}
+	now = store.Counters{Listed: int64(len(f.rows)), ContentBytes: u.ContentBytes, ImageBytes: u.ImageBytes, AudioBytes: u.AudioBytes}
+	was = now
+	if f.drifted != nil {
+		was = *f.drifted
+	}
+	return was, now, nil
+}
+
+func (f *fakeStore) saveWord(_ context.Context, user string, w store.SavedWord, max int, contentQuota int64, categoryIDs []string) (int, error) {
 	for _, id := range categoryIDs {
 		if f.category(id) < 0 {
 			return 0, store.ErrNotFound
@@ -207,7 +198,7 @@ func (f *fakeStore) SaveWord(_ context.Context, user string, w store.SavedWord, 
 	}
 	return len(f.rows), nil
 }
-func (f *fakeStore) CountPending(_ context.Context, _ string, flt store.WordFilter) (int, int, bool, error) {
+func (f *fakeStore) countPending(_ context.Context, _ string, flt store.WordFilter) (int, int, bool, error) {
 	total, fresh := 0, 0
 	for _, r := range f.rows {
 		if !f.match(r.Word, flt) {
@@ -228,7 +219,7 @@ func (f *fakeStore) sorted() []store.SavedWord {
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out
 }
-func (f *fakeStore) ListPending(_ context.Context, _ string, after time.Time, afterWord, query string, flt store.WordFilter, limit int) ([]store.SavedWord, error) {
+func (f *fakeStore) listPending(_ context.Context, _ string, after time.Time, afterWord, query string, flt store.WordFilter, limit int) ([]store.SavedWord, error) {
 	all := f.sorted()
 	var out []store.SavedWord
 	for i := len(all) - 1; i >= 0; i-- { // newest first
@@ -252,7 +243,7 @@ func (f *fakeStore) ListPending(_ context.Context, _ string, after time.Time, af
 	}
 	return out, nil
 }
-func (f *fakeStore) Pending(_ context.Context, _ string, scope store.Scope, flt store.WordFilter, words []string, limit int) ([]store.SavedWord, error) {
+func (f *fakeStore) pending(_ context.Context, _ string, scope store.Scope, flt store.WordFilter, words []string, limit int) ([]store.SavedWord, error) {
 	var out []store.SavedWord
 	defer func() {
 		if limit > 0 && len(out) > limit {
@@ -272,14 +263,14 @@ func (f *fakeStore) Pending(_ context.Context, _ string, scope store.Scope, flt 
 	}
 	return out, nil
 }
-func (f *fakeStore) DeletePending(_ context.Context, _, word string) error {
+func (f *fakeStore) deletePending(_ context.Context, _, word string) error {
 	if _, ok := f.rows[word]; !ok {
 		return store.ErrNotFound
 	}
 	delete(f.rows, word)
 	return nil
 }
-func (f *fakeStore) MarkExported(_ context.Context, _ string, words []string, remove bool) (int64, error) {
+func (f *fakeStore) markExported(_ context.Context, _ string, words []string, remove bool) (int64, error) {
 	if f.failMark {
 		return 0, errors.New("db down")
 	}
@@ -295,7 +286,7 @@ func (f *fakeStore) MarkExported(_ context.Context, _ string, words []string, re
 	}
 	return int64(len(words)), nil
 }
-func (f *fakeStore) RemoveExported(context.Context, string) (int64, error) {
+func (f *fakeStore) removeExported(context.Context, string) (int64, error) {
 	var n int64
 	for w, r := range f.rows {
 		if r.Exported {
@@ -401,7 +392,7 @@ func (f *fakeDecks) Build(_ context.Context, _ string, w []anki.Word, fresh bool
 
 func newService(st *fakeStore, d *fakeDecks) *Service {
 	return New(fakeLooker{words: map[string]*lookup.Word{"hello": {Text: "hello", Meanings: []lookup.Meaning{{Definition: "a greeting", MachineTranslated: true}}}}},
-		st, d, Config{MaxSavedWords: 3, ExportedRetentionHours: 168, AudioHosts: []string{"api.dictionaryapi.dev"}})
+		testRegistry(), st, d, Config{MaxSavedWords: 3, ExportedRetentionHours: 168, AudioHosts: []string{"api.dictionaryapi.dev"}})
 }
 
 func TestUserIDRules(t *testing.T) {
@@ -414,7 +405,7 @@ func TestUserIDRules(t *testing.T) {
 	want := map[string]codes.Code{"no principal": codes.Unauthenticated, "service token": codes.PermissionDenied, "subject is not a uuid": codes.Unauthenticated}
 	s := newService(newFakeStore(), &fakeDecks{})
 	for name, ctx := range cases {
-		_, err := s.SaveWord(ctx, &dictionaryv1.SaveWordRequest{Word: "hello"})
+		_, err := s.SaveWord(ctx, &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello"})
 		if code(err) != want[name] {
 			t.Errorf("%s: code = %v (%v), want %v", name, code(err), err, want[name])
 		}
@@ -423,34 +414,34 @@ func TestUserIDRules(t *testing.T) {
 
 func TestLookup(t *testing.T) {
 	s := newService(newFakeStore(), &fakeDecks{})
-	r, err := s.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Word: "Hello"})
+	r, err := s.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Dictionary: "english", Word: "Hello"})
 	if err != nil || r.Word.Text != "hello" || !r.Word.Meanings[0].MachineTranslated {
 		t.Fatalf("%+v, %v", r, err)
 	}
-	if _, err := s.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Word: "zzz"}); code(err) != codes.NotFound {
+	if _, err := s.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Dictionary: "english", Word: "zzz"}); code(err) != codes.NotFound {
 		t.Errorf("unknown word: %v", err)
 	}
-	if _, err := s.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Word: "a/b"}); code(err) != codes.InvalidArgument {
+	if _, err := s.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Dictionary: "english", Word: "a/b"}); code(err) != codes.InvalidArgument {
 		t.Errorf("invalid word: %v", err)
 	}
-	if _, err := s.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Word: "x", Dictionary: 99}); code(err) != codes.InvalidArgument {
+	if _, err := s.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Word: "x", Dictionary: "latin"}); code(err) != codes.InvalidArgument {
 		t.Errorf("unknown dictionary: %v", err)
 	}
-	down := New(fakeLooker{err: fmt.Errorf("%w: boom", lookup.ErrUnavailable)}, newFakeStore(), &fakeDecks{}, Config{})
-	_, err = down.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Word: "x"})
+	down := New(fakeLooker{err: fmt.Errorf("%w: boom", lookup.ErrUnavailable)}, testRegistry(), newFakeStore(), &fakeDecks{}, Config{})
+	_, err = down.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Dictionary: "english", Word: "x"})
 	if code(err) != codes.Unavailable || strings.Contains(err.Error(), "boom") {
 		t.Errorf("provider failure must be Unavailable without details: %v", err)
 	}
 
-	many, err := s.LookupWords(userCtx(), &dictionaryv1.LookupWordsRequest{Words: []string{"hello", "nope"}})
+	many, err := s.LookupWords(userCtx(), &dictionaryv1.LookupWordsRequest{Dictionary: "english", Words: []string{"hello", "nope"}})
 	if err != nil || len(many.Words) != 1 || len(many.NotFound) != 1 || many.NotFound[0] != "nope" {
 		t.Errorf("LookupWords: %+v, %v", many, err)
 	}
-	if _, err := s.LookupWords(userCtx(), &dictionaryv1.LookupWordsRequest{}); code(err) != codes.InvalidArgument {
+	if _, err := s.LookupWords(userCtx(), &dictionaryv1.LookupWordsRequest{Dictionary: "english"}); code(err) != codes.InvalidArgument {
 		t.Errorf("no words: %v", err)
 	}
 	tooMany := make([]string, 21)
-	if _, err := s.LookupWords(userCtx(), &dictionaryv1.LookupWordsRequest{Words: tooMany}); code(err) != codes.InvalidArgument {
+	if _, err := s.LookupWords(userCtx(), &dictionaryv1.LookupWordsRequest{Dictionary: "english", Words: tooMany}); code(err) != codes.InvalidArgument {
 		t.Errorf("21 words: %v", err)
 	}
 }
@@ -459,7 +450,7 @@ func TestSaveWord(t *testing.T) {
 	st := newFakeStore()
 	s := newService(st, &fakeDecks{})
 	for i, w := range []string{"One", "two", "three"} {
-		r, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: w, Content: "c"})
+		r, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: w, Content: "c"})
 		if err != nil || int(r.SavedCount) != i+1 {
 			t.Fatalf("save %q: %+v, %v", w, r, err)
 		}
@@ -467,25 +458,25 @@ func TestSaveWord(t *testing.T) {
 	if _, ok := st.rows["one"]; !ok {
 		t.Error("the word must be stored normalized")
 	}
-	_, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "four"})
+	_, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "four"})
 	if code(err) != codes.ResourceExhausted || !strings.HasPrefix(status.Convert(err).Message(), CodeMaxSavedWords) {
 		t.Errorf("limit: code=%v err=%v", code(err), err)
 	}
-	if r, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "one", Content: "again"}); err != nil || r.SavedCount != 3 {
+	if r, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "one", Content: "again"}); err != nil || r.SavedCount != 3 {
 		t.Errorf("saving a pending word again is an update: %+v, %v", r, err)
 	}
 
 	for _, req := range []*dictionaryv1.SaveWordRequest{
-		{Word: "a/b"},
-		{Word: "ok", Content: strings.Repeat("x", settings.DefaultMaxContentBytes+1)},
-		{Word: "ok", AudioUs: "https://evil.example/a.mp3"},
-		{Word: "ok", AudioUk: "http://api.dictionaryapi.dev/a.mp3"},
+		{Group: "en", Word: "a/b"},
+		{Group: "en", Word: "ok", Content: strings.Repeat("x", settings.DefaultMaxContentBytes+1)},
+		{Group: "en", Word: "ok", AudioUs: "https://evil.example/a.mp3"},
+		{Group: "en", Word: "ok", AudioUk: "http://api.dictionaryapi.dev/a.mp3"},
 	} {
 		if _, err := s.SaveWord(userCtx(), req); code(err) != codes.InvalidArgument {
 			t.Errorf("%+v: code = %v, want InvalidArgument", req, code(err))
 		}
 	}
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "one", AudioUs: "https://api.dictionaryapi.dev/m/one-us.mp3"}); err != nil {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "one", AudioUs: "https://api.dictionaryapi.dev/m/one-us.mp3"}); err != nil {
 		t.Errorf("an allowed audio host: %v", err)
 	}
 }
@@ -495,7 +486,7 @@ func TestListSavedWordsQuery(t *testing.T) {
 	s := newService(st, &fakeDecks{})
 	s.cfg.MaxSavedWords = 10
 	for _, w := range []string{"apple", "Pineapple", "banana", "grape", "apply"} {
-		if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: w}); err != nil {
+		if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: w}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -506,7 +497,7 @@ func TestListSavedWordsQuery(t *testing.T) {
 		}
 		return strings.Join(out, ",")
 	}
-	r, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Query: "  APP "})
+	r, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en", Query: "  APP "})
 	if err != nil || words(r) != "apply,pineapple,apple" {
 		t.Fatalf("substring, any case: %q, %v", words(r), err)
 	}
@@ -514,18 +505,18 @@ func TestListSavedWordsQuery(t *testing.T) {
 		t.Errorf("total = %d, want the unfiltered 5", r.Total)
 	}
 	// pages keep working with a query
-	r, err = s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Query: "app", PageSize: 2})
+	r, err = s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en", Query: "app", PageSize: 2})
 	if err != nil || words(r) != "apply,pineapple" || r.NextPageToken == "" {
 		t.Fatalf("page 1: %q token=%q %v", words(r), r.NextPageToken, err)
 	}
-	r, err = s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Query: "app", PageSize: 2, PageToken: r.NextPageToken})
+	r, err = s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en", Query: "app", PageSize: 2, PageToken: r.NextPageToken})
 	if err != nil || words(r) != "apple" || r.NextPageToken != "" {
 		t.Fatalf("page 2: %q token=%q %v", words(r), r.NextPageToken, err)
 	}
-	if r, _ = s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Query: "%"}); len(r.Words) != 0 {
+	if r, _ = s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en", Query: "%"}); len(r.Words) != 0 {
 		t.Errorf("%% is a plain character, got %q", words(r))
 	}
-	if _, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Query: strings.Repeat("a", 101)}); code(err) != codes.InvalidArgument {
+	if _, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en", Query: strings.Repeat("a", 101)}); code(err) != codes.InvalidArgument {
 		t.Errorf("long query: %v", err)
 	}
 }
@@ -535,14 +526,14 @@ func TestListSavedWordsPages(t *testing.T) {
 	s := newService(st, &fakeDecks{})
 	s.cfg.MaxSavedWords = 10
 	for _, w := range []string{"a", "b", "c", "d", "e"} {
-		if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: w}); err != nil {
+		if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: w}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	var got []string
 	token := ""
 	for pages := 0; pages < 5; pages++ {
-		r, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{PageSize: 2, PageToken: token})
+		r, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en", PageSize: 2, PageToken: token})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -559,10 +550,10 @@ func TestListSavedWordsPages(t *testing.T) {
 	if strings.Join(got, "") != "edcba" {
 		t.Errorf("order = %v, want newest first (edcba)", got)
 	}
-	if _, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{PageToken: "!!!"}); code(err) != codes.InvalidArgument {
+	if _, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en", PageToken: "!!!"}); code(err) != codes.InvalidArgument {
 		t.Errorf("bad token: %v", err)
 	}
-	if _, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{PageSize: -1}); code(err) != codes.InvalidArgument {
+	if _, err := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en", PageSize: -1}); code(err) != codes.InvalidArgument {
 		t.Errorf("negative page size: %v", err)
 	}
 }
@@ -570,11 +561,11 @@ func TestListSavedWordsPages(t *testing.T) {
 func TestDeleteSavedWord(t *testing.T) {
 	st := newFakeStore()
 	s := newService(st, &fakeDecks{})
-	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "gone"})
-	if _, err := s.DeleteSavedWord(userCtx(), &dictionaryv1.DeleteSavedWordRequest{Word: "Gone"}); err != nil {
+	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "gone"})
+	if _, err := s.DeleteSavedWord(userCtx(), &dictionaryv1.DeleteSavedWordRequest{Group: "en", Word: "Gone"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.DeleteSavedWord(userCtx(), &dictionaryv1.DeleteSavedWordRequest{Word: "gone"}); code(err) != codes.NotFound {
+	if _, err := s.DeleteSavedWord(userCtx(), &dictionaryv1.DeleteSavedWordRequest{Group: "en", Word: "gone"}); code(err) != codes.NotFound {
 		t.Errorf("second delete: %v", err)
 	}
 }
@@ -584,14 +575,14 @@ func TestExportAnki(t *testing.T) {
 	decks := &fakeDecks{}
 	s := newService(st, decks)
 
-	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{}); code(err) != codes.InvalidArgument ||
+	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"}); code(err) != codes.InvalidArgument ||
 		!strings.HasPrefix(status.Convert(err).Message(), CodeNoWords) {
 		t.Errorf("nothing to export: %v", err)
 	}
 
-	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "one", Content: "1"})
-	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "two", Content: "2"})
-	r, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{DeckName: "A/B: deck"})
+	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "one", Content: "1"})
+	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "two", Content: "2"})
+	r, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en", DeckName: "A/B: deck"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -604,19 +595,19 @@ func TestExportAnki(t *testing.T) {
 	if len(st.rows) != 0 || !st.exported["one"] || !st.exported["two"] {
 		t.Errorf("the words must be marked exported: pending=%v exported=%v", st.rows, st.exported)
 	}
-	if r, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{}); r.Total != 0 {
+	if r, _ := s.ListSavedWords(userCtx(), &dictionaryv1.ListSavedWordsRequest{Group: "en"}); r.Total != 0 {
 		t.Errorf("a new batch starts: total = %d", r.Total)
 	}
 
 	// a deck that is too large, or a failure, leaves the words pending
-	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "three"})
+	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "three"})
 	decks.err = anki.ErrTooLarge
-	_, err = s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{})
+	_, err = s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"})
 	if code(err) != codes.FailedPrecondition || !strings.HasPrefix(status.Convert(err).Message(), CodeExportTooBig) {
 		t.Errorf("too large: %v", err)
 	}
 	decks.err = errors.New("sqlite exploded")
-	_, err = s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{})
+	_, err = s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"})
 	if code(err) != codes.Internal || strings.Contains(err.Error(), "sqlite") {
 		t.Errorf("build failure must be Internal without details: %v", err)
 	}
@@ -626,7 +617,7 @@ func TestExportAnki(t *testing.T) {
 
 	decks.err = nil
 	long := strings.Repeat("x", maxDeckRunes+1)
-	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{DeckName: long}); code(err) != codes.InvalidArgument {
+	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en", DeckName: long}); code(err) != codes.InvalidArgument {
 		t.Errorf("long deck name: %v", err)
 	}
 }
@@ -639,11 +630,11 @@ func TestDeckLinkCreateAndDownloadOnce(t *testing.T) {
 	st := newFakeStore()
 	s := newService(st, &fakeDecks{})
 
-	if _, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{}); code(err) != codes.InvalidArgument {
+	if _, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{Group: "en"}); code(err) != codes.InvalidArgument {
 		t.Fatalf("nothing to export: %v", err)
 	}
-	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "one", Content: "1"})
-	r, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{DeckName: "A/B"})
+	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "one", Content: "1"})
+	r, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{Group: "en", DeckName: "A/B"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -689,8 +680,8 @@ func TestDeckLinkExpiresAndKeepsWordsPendingOnFailure(t *testing.T) {
 	st := newFakeStore()
 	s := newService(st, &fakeDecks{})
 	s.cfg.DeckLinkTTL = time.Millisecond
-	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "one"})
-	r, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{})
+	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "one"})
+	r, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{Group: "en"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -699,12 +690,21 @@ func TestDeckLinkExpiresAndKeepsWordsPendingOnFailure(t *testing.T) {
 		t.Errorf("expired link: %v", err)
 	}
 
-	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "two"})
+	_, _ = s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "two"})
 	st.failMark = true
-	if _, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{}); code(err) != codes.Internal {
+	if _, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{Group: "en"}); code(err) != codes.Internal {
 		t.Errorf("mark failure: %v", err)
 	}
 	if len(st.rows) != 1 {
 		t.Errorf("the words stay pending: %v", st.rows)
 	}
+}
+
+// testRegistry is the dictionaries of the tests: the two of the group "en" (on until chosen) and a dictionary of
+// the group "x" that is off until an administrator enables it, the way a new dictionary starts.
+func testRegistry() *lookup.Registry {
+	return lookup.NewRegistry().
+		Register(lookup.Entry{ID: "english", Group: "en", Source: "en", Target: "en", DefaultOn: true}).
+		Register(lookup.Entry{ID: "english-vietnamese", Group: "en", Source: "en", Target: "vi", DefaultOn: true}).
+		Register(lookup.Entry{ID: "test-x", Group: "x", Source: "xx", Target: "xx"})
 }

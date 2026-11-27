@@ -32,7 +32,11 @@ func (s *Service) systemDefaults() settings.System {
 		}
 		return fallback
 	}
-	return def.WithExportLimits(
+	defaults := map[string]bool{}
+	for _, e := range s.registry.Entries() {
+		defaults[e.ID] = e.DefaultOn
+	}
+	return def.WithDictionaries(s.registry.IDs(), defaults).WithExportLimits(
 		pick(s.cfg.ExportMaxBytes, def.ExportMaxBytes), pick(s.cfg.ExportPartMaxBytes, def.ExportPartMaxBytes),
 		pick(s.cfg.ExportMaxBytesCeiling, def.ExportMaxBytesCeiling), pick(s.cfg.ExportPartMaxBytesCeiling, def.ExportPartMaxBytesCeiling),
 	).WithExportSyncMaxWords(pick(s.cfg.ExportSyncMax, def.ExportSyncMaxWords)).WithStorageLimits(s.storageLimits())
@@ -51,12 +55,12 @@ func (s *Service) storageLimits() settings.StorageLimits {
 	return l
 }
 
-func (s *Service) requireDictionary(ctx context.Context, d lookup.Dictionary) error {
+func (s *Service) requireDictionary(ctx context.Context, id string) error {
 	sys, err := s.system(ctx)
 	if err != nil {
 		return err
 	}
-	if !sys.Enabled(settingsName(d)) {
+	if !sys.Enabled(id) {
 		return apperror.Wrap(codes.FailedPrecondition, CodeDictionaryDisabled+": this dictionary is turned off", nil).WithReason("dictionary_disabled")
 	}
 	return nil
@@ -75,17 +79,43 @@ func (s *Service) requireExport(ctx context.Context, link bool) (settings.System
 	return sys, nil
 }
 
-func settingsName(d lookup.Dictionary) string {
-	if d == lookup.EnglishVietnamese {
-		return settings.EnglishVietnamese
+// requireGroupAllowed checks that a word can be saved in the group: at least one of its dictionaries is on for the
+// system and for the user (a user who turned one off still saves the words of the others, and the card then holds
+// the parts that were looked up).
+func (s *Service) requireGroupAllowed(ctx context.Context, sys settings.System, g lookup.Group) error {
+	prefs := s.userPrefs(ctx)
+	for _, e := range g.Entries {
+		if prefs.Allows(sys, e.ID) {
+			return nil
+		}
 	}
-	return settings.English
+	return apperror.Wrap(codes.FailedPrecondition, CodeDictionaryDisabled+": the dictionaries of this group are turned off", nil).WithReason("dictionary_disabled")
+}
+
+// ListDictionaries lists the dictionaries of the registry by group, with whether each is on for the user.
+func (s *Service) ListDictionaries(ctx context.Context, _ *dictionaryv1.ListDictionariesRequest) (*dictionaryv1.ListDictionariesResponse, error) {
+	sys, err := s.system(ctx)
+	if err != nil {
+		return nil, err
+	}
+	prefs := s.userPrefs(ctx)
+	out := &dictionaryv1.ListDictionariesResponse{}
+	for _, g := range s.registry.Groups() {
+		pg := &dictionaryv1.DictionaryGroup{Id: g.ID}
+		for _, e := range g.Entries {
+			pg.Dictionaries = append(pg.Dictionaries, &dictionaryv1.DictionaryInfo{
+				Id: e.ID, Group: e.Group, Source: e.Source, Target: e.Target, Enabled: prefs.Allows(sys, e.ID),
+			})
+		}
+		out.Groups = append(out.Groups, pg)
+	}
+	return out, nil
 }
 
 func toProtoSystem(s settings.System) *dictionaryv1.Settings {
 	return &dictionaryv1.Settings{
 		MaxSavedWords: int32(s.MaxSavedWords), AllowExportDeck: s.AllowExportDeck, AllowExportLink: s.AllowExportLink,
-		EnglishEnabled: s.EnglishEnabled, EnglishViEnabled: s.EnglishViEnabled,
+		Dictionaries:      s.Dictionaries,
 		RemoveAfterExport: s.RemoveAfterExport, ExportedRetentionHours: int32(s.ExportedRetentionHours),
 		MaxCategories: int32(s.MaxCategories), MaxCategoryNameLength: int32(s.MaxCategoryNameLength),
 		ExportMaxBytes: int32(s.ExportMaxBytes), ExportPartMaxBytes: int32(s.ExportPartMaxBytes),
@@ -98,12 +128,8 @@ func toProtoSystem(s settings.System) *dictionaryv1.Settings {
 }
 
 func toProtoUser(u settings.User) *dictionaryv1.UserSettings {
-	d := dictionaryv1.Dictionary_DICTIONARY_ENGLISH
-	if u.DefaultDictionary == settings.EnglishVietnamese {
-		d = dictionaryv1.Dictionary_DICTIONARY_ENGLISH_VIETNAMESE
-	}
 	return &dictionaryv1.UserSettings{
-		EnglishEnabled: u.EnglishEnabled, EnglishViEnabled: u.EnglishViEnabled, DefaultDictionary: d,
+		Dictionaries: u.Dictionaries, DefaultDictionary: u.DefaultDictionary,
 		DeckName: u.DeckName, MaxLookupWords: int32(u.MaxLookupWords),
 		RemoveAfterExport: u.RemoveAfterExport, RemoveAcknowledged: u.RemoveAcknowledged, FreshDeck: u.FreshDeck,
 		ReviewNewPerDay: int32(u.ReviewNewPerDay), ReviewMaxPerDay: int32(u.ReviewMaxPerDay),
@@ -133,7 +159,6 @@ func (s *Service) UpdateSettings(ctx context.Context, req *dictionaryv1.UpdateSe
 	}
 	next := settings.System{
 		MaxSavedWords: int(in.GetMaxSavedWords()), AllowExportDeck: in.GetAllowExportDeck(), AllowExportLink: in.GetAllowExportLink(),
-		EnglishEnabled: in.GetEnglishEnabled(), EnglishViEnabled: in.GetEnglishViEnabled(),
 		RemoveAfterExport: in.GetRemoveAfterExport(), ExportedRetentionHours: int(in.GetExportedRetentionHours()),
 		MaxCategories: int(in.GetMaxCategories()), MaxCategoryNameLength: int(in.GetMaxCategoryNameLength()),
 		ExportMaxBytes: int(in.GetExportMaxBytes()), ExportPartMaxBytes: int(in.GetExportPartMaxBytes()), ExportSyncMaxWords: int(in.GetExportSyncMaxWords()),
@@ -142,6 +167,17 @@ func (s *Service) UpdateSettings(ctx context.Context, req *dictionaryv1.UpdateSe
 		ImageUserQuota: in.GetImageUserQuota(), AudioUserQuota: in.GetAudioUserQuota(),
 		MaxContentBytesCeiling: cur.MaxContentBytesCeiling, ContentUserQuotaCeiling: cur.ContentUserQuotaCeiling,
 		ImageUserQuotaCeiling: cur.ImageUserQuotaCeiling, AudioUserQuotaCeiling: cur.AudioUserQuotaCeiling,
+	}
+	// a dictionary the request leaves out keeps its value; one the registry does not have is refused
+	next.Dictionaries, next.DictionaryOrder = make(map[string]bool, len(cur.Dictionaries)), cur.DictionaryOrder
+	for id, on := range cur.Dictionaries {
+		next.Dictionaries[id] = on
+	}
+	for id, on := range in.GetDictionaries() {
+		if _, ok := cur.Dictionaries[id]; !ok {
+			return nil, apperror.InvalidArgument("unknown dictionary").WithReason("unknown_dictionary", "dictionary", id)
+		}
+		next.Dictionaries[id] = on
 	}
 	// A client older than these settings does not send them: the current values stay.
 	if next.MaxCategories == 0 {
@@ -231,8 +267,7 @@ func (s *Service) UpdateMySettings(ctx context.Context, req *dictionaryv1.Update
 		return nil, err
 	}
 	u := settings.User{
-		EnglishEnabled: in.GetEnglishEnabled(), EnglishViEnabled: in.GetEnglishViEnabled(),
-		DefaultDictionary: settings.English, DeckName: in.GetDeckName(), MaxLookupWords: int(in.GetMaxLookupWords()),
+		Dictionaries: in.GetDictionaries(), DefaultDictionary: in.GetDefaultDictionary(), DeckName: in.GetDeckName(), MaxLookupWords: int(in.GetMaxLookupWords()),
 		RemoveAfterExport: in.GetRemoveAfterExport(), RemoveAcknowledged: in.GetRemoveAcknowledged(), FreshDeck: in.GetFreshDeck(),
 		ReviewNewPerDay: int(in.GetReviewNewPerDay()), ReviewMaxPerDay: int(in.GetReviewMaxPerDay()),
 		ReviewAlgorithm: in.GetReviewAlgorithm(), DesiredRetention: int(in.GetDesiredRetention()),
@@ -243,9 +278,6 @@ func (s *Service) UpdateMySettings(ctx context.Context, req *dictionaryv1.Update
 	}
 	if u.DesiredRetention == 0 {
 		u.DesiredRetention = settings.DefaultDesiredRetention
-	}
-	if in.GetDefaultDictionary() == dictionaryv1.Dictionary_DICTIONARY_ENGLISH_VIETNAMESE {
-		u.DefaultDictionary = settings.EnglishVietnamese
 	}
 	if u.DeckName, err = deckNameOrEmpty(u.DeckName); err != nil {
 		return nil, err

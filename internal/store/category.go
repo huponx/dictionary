@@ -20,61 +20,77 @@ type Category struct {
 	Total, New int
 }
 
-// WordFilter narrows the words of the list by category. The zero value keeps every word.
+// WordFilter narrows the words of the list to one group and, optionally, one category.
 type WordFilter struct {
+	// Group of the words (required): the key of a saved word is (user, group, word).
+	Group string
 	// CategoryID keeps the words in that category (an unknown or malformed id matches nothing).
 	CategoryID string
 	// Uncategorized keeps the words that are in no category; CategoryID is then ignored.
 	Uncategorized bool
 }
 
-// clause is the condition (starting with " AND ") on the saved words table called alias, or "". It appends the
-// argument it needs to args.
+// byCategory reports whether the filter reads one category (its links), not the whole list.
+func (f WordFilter) byCategory() bool { return f.CategoryID != "" && !f.Uncategorized }
+
+// narrowed reports whether the filter keeps less than the words of the group.
+func (f WordFilter) narrowed() bool { return f.CategoryID != "" || f.Uncategorized }
+
+// clause is the condition (starting with " AND ") on the saved words table called alias: its group and its
+// category filter. It appends the arguments it needs to args, the group first.
 func (f WordFilter) clause(alias string, args *[]any) string {
+	*args = append(*args, f.Group)
+	out := ` AND ` + alias + `.grp = $` + strconv.Itoa(len(*args))
 	switch {
 	case f.Uncategorized:
-		return ` AND NOT ` + alias + `.categorized`
+		return out + ` AND NOT ` + alias + `.categorized`
 	case f.CategoryID != "":
 		id, err := uuid.Parse(f.CategoryID)
 		if err != nil {
 			id = uuid.Nil
 		}
 		*args = append(*args, id.String())
-		return ` AND EXISTS (SELECT 1 FROM dictionary_word_categories wc WHERE wc.user_id = ` + alias + `.user_id AND wc.word = ` + alias +
-			`.word AND wc.category_id = $` + strconv.Itoa(len(*args)) + `::uuid)`
+		return out + ` AND EXISTS (SELECT 1 FROM dictionary_word_categories wc WHERE wc.user_id = ` + alias + `.user_id AND wc.grp = ` + alias +
+			`.grp AND wc.word = ` + alias + `.word AND wc.category_id = $` + strconv.Itoa(len(*args)) + `::uuid)`
 	}
-	return ""
+	return out
 }
 
 // wordSource is what a query of the list reads: the words of the user (alias w) that pass the filter, and the columns
-// that order them. The words of one category are read from its links, whose index (user_id, category_id, created_at,
-// word) gives them in order and stops at the LIMIT; every other filter reads the list itself. The links carry the
-// created_at of their word (kept equal by the store), so both orders and both keys are the same.
+// that order them. The words of one category are read from its links, whose index (user_id, category_id, grp,
+// created_at, word) gives them in order and stops at the LIMIT; every other filter reads the list itself. The links
+// carry the created_at of their word (kept equal by the store), so both orders and both keys are the same.
 type wordSource struct {
 	from, where   string
 	created, word string // the sort key columns
+	// group and category are the placeholders ("$3") of the arguments the source appended; category is "" for a
+	// filter that is not by category
+	group, category string
 }
 
 // source builds the source of the words for userID, which is $1 of the query; it appends the arguments it needs
 // to args.
 func (f WordFilter) source(args *[]any) wordSource {
-	if f.CategoryID != "" && !f.Uncategorized {
+	if f.byCategory() {
 		id, err := uuid.Parse(f.CategoryID)
 		if err != nil {
 			id = uuid.Nil
 		}
-		*args = append(*args, id.String())
+		*args = append(*args, f.Group, id.String())
+		grp, cat := "$"+strconv.Itoa(len(*args)-1), "$"+strconv.Itoa(len(*args))
 		return wordSource{
-			from: `dictionary_word_categories wc JOIN dictionary_saved_words w ON w.user_id = wc.user_id AND w.word = wc.word`,
+			from: `dictionary_word_categories wc JOIN dictionary_saved_words w ON w.user_id = wc.user_id AND w.grp = wc.grp AND w.word = wc.word`,
 			// w.user_id = $1 is redundant, but without it the planner joins the words by the trigram index (4 ms a word)
-			where:   `wc.user_id = $1 AND w.user_id = $1 AND wc.category_id = $` + strconv.Itoa(len(*args)) + `::uuid AND w.removed_at IS NULL`,
-			created: "wc.created_at", word: "wc.word",
+			where:   `wc.user_id = $1 AND w.user_id = $1 AND wc.category_id = ` + cat + `::uuid AND wc.grp = ` + grp + ` AND w.grp = ` + grp + ` AND w.removed_at IS NULL`,
+			created: "wc.created_at", word: "wc.word", group: grp, category: cat,
 		}
 	}
+	cl := f.clause("w", args)
+	grp := "$" + strconv.Itoa(len(*args))
 	return wordSource{
 		from:    `dictionary_saved_words w`,
-		where:   `w.user_id = $1 AND w.removed_at IS NULL` + f.clause("w", args),
-		created: "w.created_at", word: "w.word",
+		where:   `w.user_id = $1 AND w.removed_at IS NULL` + cl,
+		created: "w.created_at", word: "w.word", group: grp,
 	}
 }
 
@@ -96,18 +112,18 @@ type Categories struct {
 // ListCategories returns the categories of the user by name, and the number of words (total, new) of the list in
 // no category. The counts of a category stop at categoryCountCap and the ones of the uncategorized words at countCap,
 // so the cost is bounded by that and the number of categories, not by the size of the list.
-func (s *Store) ListCategories(ctx context.Context, userID string) (Categories, error) {
+func (s *Store) ListCategories(ctx context.Context, userID, group string) (Categories, error) {
 	// Per category, a bounded range scan on the links of the category (index user_id, category_id). The word is
 	// looked up with a subplan per link, not joined: a join lets the planner hash the whole list of the user for
 	// every category (17 s for 100 categories of 1,000,000 words), a subplan stops at the cap.
 	count := func(extra string) string {
 		return `(SELECT count(*) FROM (SELECT 1 FROM (SELECT EXISTS (SELECT 1 FROM dictionary_saved_words w
-				WHERE w.user_id = wc.user_id AND w.word = wc.word AND w.removed_at IS NULL` + extra + `) AS listed
-			FROM dictionary_word_categories wc WHERE wc.user_id = c.user_id AND wc.category_id = c.id) x WHERE listed LIMIT $2) t)`
+				WHERE w.user_id = wc.user_id AND w.grp = wc.grp AND w.word = wc.word AND w.removed_at IS NULL` + extra + `) AS listed
+			FROM dictionary_word_categories wc WHERE wc.user_id = c.user_id AND wc.category_id = c.id AND wc.grp = $3) x WHERE listed LIMIT $2) t)`
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT c.id::text, c.name, `+count("")+`, `+count(" AND w.exported_at IS NULL")+`
-		FROM dictionary_categories c WHERE c.user_id = $1 ORDER BY lower(c.name), c.id`, userID, categoryCountCap)
+		FROM dictionary_categories c WHERE c.user_id = $1 ORDER BY lower(c.name), c.id`, userID, categoryCountCap, group)
 	if err != nil {
 		return Categories{}, mapErr(err)
 	}
@@ -126,7 +142,7 @@ func (s *Store) ListCategories(ctx context.Context, userID string) (Categories, 
 	}
 	rows.Close()
 	var capped bool
-	out.UncatTotal, out.UncatNew, capped, err = s.CountPending(ctx, userID, WordFilter{Uncategorized: true})
+	out.UncatTotal, out.UncatNew, capped, err = s.CountPending(ctx, userID, WordFilter{Group: group, Uncategorized: true})
 	out.Capped = out.Capped || capped
 	return out, err
 }
@@ -199,18 +215,23 @@ func (s *Store) DeleteCategory(ctx context.Context, userID, id string) error {
 		var n int
 		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 			rows, err := tx.Query(ctx, `DELETE FROM dictionary_word_categories
-				WHERE (user_id, word, category_id) IN (
-					SELECT user_id, word, category_id FROM dictionary_word_categories WHERE user_id = $1 AND category_id = $2 LIMIT $3)
-				RETURNING word`, userID, cid, unlinkBatch)
+				WHERE (user_id, grp, word, category_id) IN (
+					SELECT user_id, grp, word, category_id FROM dictionary_word_categories WHERE user_id = $1 AND category_id = $2 LIMIT $3)
+				RETURNING grp, word`, userID, cid, unlinkBatch)
 			if err != nil {
 				return err
 			}
-			words, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			keys, err := pgx.CollectRows(rows, pgx.RowToStructByPos[wordKey])
 			if err != nil {
 				return err
 			}
-			n = len(words)
-			return refreshCategorized(ctx, tx, userID, words)
+			n = len(keys)
+			for _, g := range groupKeys(keys) {
+				if err := refreshCategorized(ctx, tx, userID, g.group, g.words); err != nil {
+					return err
+				}
+			}
+			return nil
 		})
 		if err != nil {
 			return mapErr(err)
@@ -229,20 +250,44 @@ func (s *Store) DeleteCategory(ctx context.Context, userID, id string) error {
 	return nil
 }
 
-// refreshCategorized sets the categorized flag of the words from their links.
-func refreshCategorized(ctx context.Context, tx pgx.Tx, userID string, words []string) error {
+// wordKey is (group, word), the key of a saved word of one user.
+type wordKey struct{ Group, Word string }
+
+type groupWords struct {
+	group string
+	words []string
+}
+
+// groupKeys splits keys into the words of each group, in order of first appearance.
+func groupKeys(keys []wordKey) []groupWords {
+	var out []groupWords
+	at := map[string]int{}
+	for _, k := range keys {
+		i, ok := at[k.Group]
+		if !ok {
+			i = len(out)
+			at[k.Group] = i
+			out = append(out, groupWords{group: k.Group})
+		}
+		out[i].words = append(out[i].words, k.Word)
+	}
+	return out
+}
+
+// refreshCategorized sets the categorized flag of the words of the group from their links.
+func refreshCategorized(ctx context.Context, tx pgx.Tx, userID, group string, words []string) error {
 	if len(words) == 0 {
 		return nil
 	}
 	_, err := tx.Exec(ctx, `UPDATE dictionary_saved_words w SET categorized = EXISTS (
-			SELECT 1 FROM dictionary_word_categories wc WHERE wc.user_id = w.user_id AND wc.word = w.word)
-		WHERE w.user_id = $1 AND w.word = ANY($2)`, userID, words)
+			SELECT 1 FROM dictionary_word_categories wc WHERE wc.user_id = w.user_id AND wc.grp = w.grp AND wc.word = w.word)
+		WHERE w.user_id = $1 AND w.grp = $3 AND w.word = ANY($2)`, userID, words, group)
 	return err
 }
 
 // SetWordCategories adds the words to the categories in add and takes them out of the ones in remove. Words that
 // are not in the list are skipped; it returns how many were. ErrNotFound when a category is not the user's.
-func (s *Store) SetWordCategories(ctx context.Context, userID string, words, add, remove []string) (int, error) {
+func (s *Store) SetWordCategories(ctx context.Context, userID, group string, words, add, remove []string) (int, error) {
 	addIDs, err := parseIDs(add)
 	if err != nil {
 		return 0, err
@@ -256,8 +301,8 @@ func (s *Store) SetWordCategories(ctx context.Context, userID string, words, add
 		if err := ownCategories(ctx, tx, userID, append(append([]string{}, addIDs...), removeIDs...)); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT word FROM dictionary_saved_words WHERE user_id = $1 AND removed_at IS NULL AND word = ANY($2)`,
-			userID, words)
+		rows, err := tx.Query(ctx, `SELECT word FROM dictionary_saved_words WHERE user_id = $1 AND grp = $3 AND removed_at IS NULL AND word = ANY($2)`,
+			userID, words, group)
 		if err != nil {
 			return err
 		}
@@ -271,19 +316,19 @@ func (s *Store) SetWordCategories(ctx context.Context, userID string, words, add
 		}
 		if len(addIDs) > 0 {
 			// the link carries the created_at of its word, see wordSource
-			if _, err := tx.Exec(ctx, `INSERT INTO dictionary_word_categories (user_id, word, category_id, created_at)
-				SELECT $1, w.word, c, w.created_at FROM dictionary_saved_words w, unnest($3::uuid[]) c
-				WHERE w.user_id = $1 AND w.word = ANY($2) ON CONFLICT DO NOTHING`, userID, listed, addIDs); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO dictionary_word_categories (user_id, grp, word, category_id, created_at)
+					SELECT $1, $4, w.word, c, w.created_at FROM dictionary_saved_words w, unnest($3::uuid[]) c
+					WHERE w.user_id = $1 AND w.grp = $4 AND w.word = ANY($2) ON CONFLICT DO NOTHING`, userID, listed, addIDs, group); err != nil {
 				return err
 			}
 		}
 		if len(removeIDs) > 0 {
 			if _, err := tx.Exec(ctx, `DELETE FROM dictionary_word_categories
-				WHERE user_id = $1 AND word = ANY($2) AND category_id = ANY($3::uuid[])`, userID, listed, removeIDs); err != nil {
+				WHERE user_id = $1 AND grp = $4 AND word = ANY($2) AND category_id = ANY($3::uuid[])`, userID, listed, removeIDs, group); err != nil {
 				return err
 			}
 		}
-		return refreshCategorized(ctx, tx, userID, listed)
+		return refreshCategorized(ctx, tx, userID, group, listed)
 	})
 	return updated, mapErr(err)
 }
@@ -323,7 +368,7 @@ func ownCategories(ctx context.Context, tx pgx.Tx, userID string, ids []string) 
 }
 
 // addCategories links the word to the categories (the ones it has stay).
-func addCategories(ctx context.Context, tx pgx.Tx, userID, word string, ids []string) error {
+func addCategories(ctx context.Context, tx pgx.Tx, userID, group, word string, ids []string) error {
 	ids, err := parseIDs(ids)
 	if err != nil || len(ids) == 0 {
 		return err
@@ -331,18 +376,18 @@ func addCategories(ctx context.Context, tx pgx.Tx, userID, word string, ids []st
 	if err := ownCategories(ctx, tx, userID, ids); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO dictionary_word_categories (user_id, word, category_id, created_at)
-		SELECT $1, $2, unnest($3::uuid[]), (SELECT created_at FROM dictionary_saved_words WHERE user_id = $1 AND word = $2)
-		ON CONFLICT DO NOTHING`, userID, word, ids); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO dictionary_word_categories (user_id, grp, word, category_id, created_at)
+			SELECT $1, $4, $2, unnest($3::uuid[]), (SELECT created_at FROM dictionary_saved_words WHERE user_id = $1 AND grp = $4 AND word = $2)
+			ON CONFLICT DO NOTHING`, userID, word, ids, group); err != nil {
 		return err
 	}
-	return refreshCategorized(ctx, tx, userID, []string{word})
+	return refreshCategorized(ctx, tx, userID, group, []string{word})
 }
 
 // categoryIDs returns the category ids of the words, by word.
-func (s *Store) categoryIDs(ctx context.Context, userID string, words []string) (map[string][]string, error) {
+func (s *Store) categoryIDs(ctx context.Context, userID, group string, words []string) (map[string][]string, error) {
 	rows, err := s.pool.Query(ctx, `SELECT word, category_id::text FROM dictionary_word_categories
-		WHERE user_id = $1 AND word = ANY($2) ORDER BY category_id`, userID, words)
+		WHERE user_id = $1 AND grp = $3 AND word = ANY($2) ORDER BY category_id`, userID, words, group)
 	if err != nil {
 		return nil, mapErr(err)
 	}

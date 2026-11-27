@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/huponx/dictionary/internal/store"
 	dictionaryv1 "github.com/huponx/protogen/go/dictionary/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -53,7 +54,7 @@ func TestSettingsStorageDefaultsAndValidation(t *testing.T) {
 func TestMaxContentBytesIsASetting(t *testing.T) {
 	s := newService(newFakeStore(), &fakeDecks{})
 	big := strings.Repeat("x", 100<<10)
-	_, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", Content: big})
+	_, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", Content: big})
 	if code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "64 KiB") {
 		t.Fatalf("at 64 KiB: %v", err)
 	}
@@ -62,10 +63,10 @@ func TestMaxContentBytesIsASetting(t *testing.T) {
 	if _, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: g.Settings}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", Content: big}); err != nil {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", Content: big}); err != nil {
 		t.Fatalf("at 128 KiB: %v", err)
 	}
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", Content: strings.Repeat("x", 128<<10+1)}); code(err) != codes.InvalidArgument ||
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", Content: strings.Repeat("x", 128<<10+1)}); code(err) != codes.InvalidArgument ||
 		!strings.Contains(err.Error(), "128 KiB") {
 		t.Fatalf("above 128 KiB: %v", err)
 	}
@@ -87,7 +88,7 @@ func TestSaveWordContentQuota(t *testing.T) {
 	s := newService(newFakeStore(), &fakeDecks{})
 	setSettings(t, s, func(x *dictionaryv1.Settings) { x.ContentUserQuota = 2 << 10 })
 	save := func(word string, n int) error {
-		_, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: word, Content: strings.Repeat("x", n)})
+		_, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: word, Content: strings.Repeat("x", n)})
 		return err
 	}
 	if err := save("hello", 1500); err != nil {
@@ -123,7 +124,7 @@ func TestUserQuotaRPCs(t *testing.T) {
 	st := newFakeStore()
 	s := newService(st, &fakeDecks{})
 	setSettings(t, s, func(x *dictionaryv1.Settings) { x.ImageUserQuota = 5 << 20 })
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", Content: "12345"}); err != nil {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", Content: "12345"}); err != nil {
 		t.Fatal(err)
 	}
 	g, err := s.GetUserQuota(userCtx(), &dictionaryv1.GetUserQuotaRequest{UserId: userUUID})
@@ -161,10 +162,30 @@ func TestUserQuotaRPCs(t *testing.T) {
 	}
 }
 
+func TestRecalculateUserStorage(t *testing.T) {
+	st := newFakeStore()
+	s := newService(st, &fakeDecks{})
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", Content: "12345"}); err != nil {
+		t.Fatal(err)
+	}
+	st.drifted = &store.Counters{Listed: 3, ContentBytes: 99, ImageBytes: 7, AudioBytes: 8}
+	r, err := s.RecalculateUserStorage(userCtx(), &dictionaryv1.RecalculateUserStorageRequest{UserId: userUUID})
+	if err != nil || r.Used.Content != 5 || r.Previous.Content != 99 || r.Previous.Image != 7 || r.Previous.Audio != 8 || r.Effective.Content != 256<<20 {
+		t.Fatalf("recalculate: %+v, %v", r, err)
+	}
+	if _, err := s.RecalculateUserStorage(userCtx(), &dictionaryv1.RecalculateUserStorageRequest{UserId: "nope"}); code(err) != codes.InvalidArgument {
+		t.Errorf("not a uuid: %v", err)
+	}
+	st.unknown = true
+	if _, err := s.RecalculateUserStorage(userCtx(), &dictionaryv1.RecalculateUserStorageRequest{UserId: otherUUID}); code(err) != codes.NotFound {
+		t.Errorf("unknown user: %v", err)
+	}
+}
+
 func TestGetMyStorage(t *testing.T) {
 	st := newFakeStore()
 	s := newService(st, &fakeDecks{})
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", Content: "12345"}); err != nil {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", Content: "12345"}); err != nil {
 		t.Fatal(err)
 	}
 	r, err := s.GetMyStorage(userCtx(), &dictionaryv1.GetMyStorageRequest{})

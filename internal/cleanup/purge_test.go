@@ -37,7 +37,7 @@ func TestPurgeDeleted(t *testing.T) {
 		if _, err := pool.Exec(ctx, `INSERT INTO identity_users (id, email) VALUES ($1, $2)`, u, u+"@dictionary.test"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pool.Exec(ctx, `INSERT INTO dictionary_saved_words (user_id, word) SELECT $1, 'w' || g FROM generate_series(1, 7) g`, u); err != nil {
+		if _, err := pool.Exec(ctx, `INSERT INTO dictionary_saved_words (user_id, grp, word) SELECT $1, 'en', 'w' || g FROM generate_series(1, 7) g`, u); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := pool.Exec(ctx, `INSERT INTO dictionary_review_bonus (user_id, expires_at) VALUES ($1, now() + interval '1 day')`, u); err != nil {

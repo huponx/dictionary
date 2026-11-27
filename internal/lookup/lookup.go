@@ -11,29 +11,30 @@ import (
 // workerLimit is the number of lookups of LookupMany that run at once (the providers are free services).
 const workerLimit = 3
 
-// Service looks words up in the provider of a dictionary and caches the entries.
+// Service looks words up in the provider of a dictionary of the registry and caches the entries.
 type Service struct {
-	providers map[Dictionary]Provider
-	cache     *cache
+	registry *Registry
+	cache    *cache
 }
 
 // New builds the service. cacheTTL or cacheSize at zero turns the cache off.
-func New(providers map[Dictionary]Provider, cacheTTL time.Duration, cacheSize int) *Service {
-	return &Service{providers: providers, cache: newCache(cacheTTL, cacheSize)}
+func New(registry *Registry, cacheTTL time.Duration, cacheSize int) *Service {
+	return &Service{registry: registry, cache: newCache(cacheTTL, cacheSize)}
 }
 
-// Lookup returns the entry of one word: ErrInvalidWord, ErrNotFound, or an error wrapping
+// Lookup returns the entry of one word: ErrUnknownDictionary, ErrInvalidWord, ErrNotFound, or an error wrapping
 // ErrUnavailable. The result is shared, do not modify it.
-func (s *Service) Lookup(ctx context.Context, d Dictionary, word string) (*Word, error) {
-	p, ok := s.providers[d]
-	if !ok {
-		return nil, fmt.Errorf("lookup: no provider for dictionary %q", d)
+func (s *Service) Lookup(ctx context.Context, d string, word string) (*Word, error) {
+	e, ok := s.registry.Entry(d)
+	if !ok || e.Provider == nil {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownDictionary, d)
 	}
+	p := e.Provider
 	word, err := NormalizeWord(word)
 	if err != nil {
 		return nil, err
 	}
-	key := string(d) + "\x00" + word
+	key := d + "\x00" + word
 	if w, ok := s.cache.get(key); ok {
 		return w, nil
 	}
@@ -47,7 +48,7 @@ func (s *Service) Lookup(ctx context.Context, d Dictionary, word string) (*Word,
 
 // LookupMany looks the words up (at most workerLimit at a time), in order and without duplicates. Words
 // without an entry come back in notFound; any other failure ends the call with that error.
-func (s *Service) LookupMany(ctx context.Context, d Dictionary, words []string) (found []*Word, notFound []string, err error) {
+func (s *Service) LookupMany(ctx context.Context, d string, words []string) (found []*Word, notFound []string, err error) {
 	seen := map[string]bool{}
 	var list []string
 	for _, w := range words {

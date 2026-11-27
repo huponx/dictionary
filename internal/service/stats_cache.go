@@ -9,7 +9,7 @@ import (
 )
 
 // categoryCache keeps the category counts of the last users in the memory of the process for a short time. The counts
-// are bounded but still cost up to countCap row visits per category, and the page of the categories asks for them on
+// (of each group) are bounded but still cost up to countCap row visits per category, and the page of the categories asks for them on
 // every visit. It is dropped at once on this instance when the user changes the list or the categories; another
 // replica shows the change after at most ttl.
 type categoryCache struct {
@@ -20,8 +20,13 @@ type categoryCache struct {
 	items map[string]*list.Element
 }
 
+// categoryEntry is what the cache keeps of one user: the counts of each group they looked at.
 type categoryEntry struct {
-	user    string
+	user   string
+	groups map[string]groupCounts
+}
+
+type groupCounts struct {
 	expires time.Time
 	value   store.Categories
 }
@@ -33,7 +38,7 @@ func (s *Service) WithCategoryCache(ttl time.Duration, max int) *Service {
 	return s
 }
 
-func (c *categoryCache) get(user string, now time.Time) (store.Categories, bool) {
+func (c *categoryCache) get(user, group string, now time.Time) (store.Categories, bool) {
 	if c == nil {
 		return store.Categories{}, false
 	}
@@ -44,28 +49,28 @@ func (c *categoryCache) get(user string, now time.Time) (store.Categories, bool)
 		return store.Categories{}, false
 	}
 	e := el.Value.(*categoryEntry)
-	if !now.Before(e.expires) {
-		c.order.Remove(el)
-		delete(c.items, user)
+	g, ok := e.groups[group]
+	if !ok || !now.Before(g.expires) {
+		delete(e.groups, group)
 		return store.Categories{}, false
 	}
 	c.order.MoveToFront(el)
-	return e.value, true
+	return g.value, true
 }
 
-func (c *categoryCache) put(user string, now time.Time, v store.Categories) {
+func (c *categoryCache) put(user, group string, now time.Time, v store.Categories) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	g := groupCounts{expires: now.Add(c.ttl), value: v}
 	if el, ok := c.items[user]; ok {
-		e := el.Value.(*categoryEntry)
-		e.value, e.expires = v, now.Add(c.ttl)
+		el.Value.(*categoryEntry).groups[group] = g
 		c.order.MoveToFront(el)
 		return
 	}
-	c.items[user] = c.order.PushFront(&categoryEntry{user: user, expires: now.Add(c.ttl), value: v})
+	c.items[user] = c.order.PushFront(&categoryEntry{user: user, groups: map[string]groupCounts{group: g}})
 	for c.order.Len() > c.max {
 		last := c.order.Back()
 		c.order.Remove(last)

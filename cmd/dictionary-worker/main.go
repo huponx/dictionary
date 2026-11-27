@@ -11,6 +11,7 @@ import (
 
 	"github.com/huponx/dictionary/internal/anki"
 	"github.com/huponx/dictionary/internal/appconfig"
+	"github.com/huponx/dictionary/internal/catalog"
 	"github.com/huponx/dictionary/internal/cleanup"
 	"github.com/huponx/dictionary/internal/filestore"
 	"github.com/huponx/dictionary/internal/service"
@@ -52,7 +53,7 @@ func main() {
 	}
 	// The jobs do not look words up, so there is no looker. The limits of the settings are the same as the API's
 	// (an export job reads the system settings with the ceilings of this process).
-	svc := service.New(nil, st, decks, service.Config{
+	svc := service.New(nil, catalog.Registry(nil), st, decks, service.Config{
 		MaxSavedWords: cfg.MaxSavedWords, ExportedRetentionHours: int(cfg.ExportedRetention / time.Hour), AudioHosts: cfg.Hosts(),
 		ExportJobTTL: cfg.ExportJobTTL, ExportMaxBytes: cfg.ExportMaxBytes, ExportPartMaxBytes: cfg.ExportPartMaxBytes,
 		ExportMaxBytesCeiling: cfg.ExportMaxBytesCeiling, ExportPartMaxBytesCeiling: cfg.ExportPartMaxBytesCeiling,

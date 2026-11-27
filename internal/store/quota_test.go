@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 func contentBytesOf(t *testing.T, s *Store, user string) (counter, actual int64) {
@@ -31,7 +34,7 @@ func TestContentBytesFollowTheList(t *testing.T) {
 	s, user := testStore(t)
 	save := func(word, content string) {
 		t.Helper()
-		if _, err := s.SaveWord(ctx, user, SavedWord{Word: word, Content: content}, 100, testQuota, nil); err != nil {
+		if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: word, Content: content}, 100, testQuota, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -45,11 +48,11 @@ func TestContentBytesFollowTheList(t *testing.T) {
 	wantBytes(t, s, user, 130)
 
 	// marking exported without remove keeps the words in the list; with remove they leave it
-	if _, err := s.MarkExported(ctx, user, []string{"a"}, false); err != nil {
+	if _, err := s.MarkExported(ctx, user, "en", []string{"a"}, false); err != nil {
 		t.Fatal(err)
 	}
 	wantBytes(t, s, user, 130)
-	if _, err := s.MarkExported(ctx, user, []string{"a"}, true); err != nil {
+	if _, err := s.MarkExported(ctx, user, "en", []string{"a"}, true); err != nil {
 		t.Fatal(err)
 	}
 	wantBytes(t, s, user, 100)
@@ -57,21 +60,21 @@ func TestContentBytesFollowTheList(t *testing.T) {
 	save("a", strings.Repeat("x", 10))
 	wantBytes(t, s, user, 110)
 
-	if err := s.DeletePending(ctx, user, "b"); err != nil {
+	if err := s.DeletePending(ctx, user, "en", "b"); err != nil {
 		t.Fatal(err)
 	}
 	wantBytes(t, s, user, 10)
-	if err := s.DeletePending(ctx, user, "nope"); !errors.Is(err, ErrNotFound) {
+	if err := s.DeletePending(ctx, user, "en", "nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
 	}
 	wantBytes(t, s, user, 10)
 
 	// RemoveExported takes the exported words that are still in the list
 	save("c", strings.Repeat("x", 20))
-	if _, err := s.MarkExported(ctx, user, []string{"c"}, false); err != nil {
+	if _, err := s.MarkExported(ctx, user, "en", []string{"c"}, false); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := s.RemoveExported(ctx, user); err != nil || n != 1 {
+	if n, err := s.RemoveExported(ctx, user, "en"); err != nil || n != 1 {
 		t.Fatalf("remove exported: %d, %v", n, err)
 	}
 	wantBytes(t, s, user, 10)
@@ -81,7 +84,7 @@ func TestContentQuota(t *testing.T) {
 	ctx := context.Background()
 	s, user := testStore(t)
 	save := func(word string, n int, quota int64) error {
-		_, err := s.SaveWord(ctx, user, SavedWord{Word: word, Content: strings.Repeat("x", n)}, 100, quota, nil)
+		_, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: word, Content: strings.Repeat("x", n)}, 100, quota, nil)
 		return err
 	}
 	if err := save("a", 60, 100); err != nil {
@@ -99,7 +102,7 @@ func TestContentQuota(t *testing.T) {
 		t.Fatalf("growing over the quota: %v", err)
 	}
 	// the words come first when both limits stop the save
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "c", Content: "xx"}, 2, 100, nil); !errors.Is(err, ErrLimit) {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "c", Content: "xx"}, 2, 100, nil); !errors.Is(err, ErrLimit) {
 		t.Fatalf("both limits: %v", err)
 	}
 
@@ -126,7 +129,7 @@ func TestContentQuota(t *testing.T) {
 	if err := save("a", 150, 1000); err != nil {
 		t.Fatalf("same size while over the quota: %v", err)
 	}
-	if err := s.DeletePending(ctx, user, "a"); err != nil {
+	if err := s.DeletePending(ctx, user, "en", "a"); err != nil {
 		t.Fatal(err)
 	}
 	wantBytes(t, s, user, 40)
@@ -152,7 +155,7 @@ func TestStorageUsageAndQuota(t *testing.T) {
 	if err := s.SetStorageQuota(ctx, user, Quotas{Content: ptr(10), Audio: ptr(30)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "a", Content: "12345"}, 10, testQuota, nil); err != nil {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "a", Content: "12345"}, 10, testQuota, nil); err != nil {
 		t.Fatal(err)
 	}
 	u, err := s.GetStorageUsage(ctx, user)
@@ -170,7 +173,7 @@ func TestStorageUsageAndQuota(t *testing.T) {
 func TestReconcileFixesContentBytes(t *testing.T) {
 	ctx := context.Background()
 	s, user := testStore(t)
-	if _, err := s.SaveWord(ctx, user, SavedWord{Word: "a", Content: "12345"}, 10, testQuota, nil); err != nil {
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "a", Content: "12345"}, 10, testQuota, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.pool.Exec(ctx, `UPDATE dictionary_user_stats SET content_bytes = 99 WHERE user_id = $1`, user); err != nil {
@@ -179,7 +182,7 @@ func TestReconcileFixesContentBytes(t *testing.T) {
 	var was Counters
 	after := ""
 	for {
-		next, f, err := s.ReconcileListed(ctx, after, 50)
+		next, f, err := s.ReconcileCounters(ctx, after, 50)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -195,4 +198,130 @@ func TestReconcileFixesContentBytes(t *testing.T) {
 		t.Errorf("drift not reported: %+v", was)
 	}
 	wantBytes(t, s, user, 5)
+}
+
+func countersOf(t *testing.T, s *Store, user string) Counters {
+	t.Helper()
+	var c Counters
+	err := s.pool.QueryRow(context.Background(), `SELECT listed, content_bytes, image_bytes, audio_bytes FROM dictionary_user_stats WHERE user_id = $1`, user).
+		Scan(&c.Listed, &c.ContentBytes, &c.ImageBytes, &c.AudioBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func TestRecomputeUserCounters(t *testing.T) {
+	ctx := context.Background()
+	s, user := testStore(t)
+	if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: "a", Content: "12345"}, 10, testQuota, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.InsertImage(ctx, Image{ID: uuid.NewString(), UserID: user, ContentType: "image/jpeg", Size: 100, SHA256: []byte(uuid.NewString())}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.InsertAudio(ctx, Audio{ID: uuid.NewString(), UserID: user, ContentType: "audio/mpeg", Size: 40, SHA256: []byte(uuid.NewString())}); err != nil {
+		t.Fatal(err)
+	}
+	want := Counters{Listed: 1, ContentBytes: 5, ImageBytes: 100, AudioBytes: 40}
+	for _, col := range []string{"listed", "content_bytes", "image_bytes", "audio_bytes"} {
+		if _, err := s.pool.Exec(ctx, `UPDATE dictionary_user_stats SET `+col+` = 999 WHERE user_id = $1`, user); err != nil {
+			t.Fatal(err)
+		}
+		was, now, err := s.RecomputeUserCounters(ctx, user)
+		if err != nil || now != want || was == want {
+			t.Fatalf("%s: was %+v now %+v, %v", col, was, now, err)
+		}
+		if got := countersOf(t, s, user); got != want {
+			t.Fatalf("%s: stored %+v", col, got)
+		}
+	}
+	if was, now, err := s.RecomputeUserCounters(ctx, user); err != nil || was != want || now != want {
+		t.Fatalf("no drift: %+v %+v %v", was, now, err)
+	}
+}
+
+func TestRecomputeUserCountersCreatesRowAndRejectsUnknown(t *testing.T) {
+	ctx := context.Background()
+	s, user := testStore(t)
+	was, now, err := s.RecomputeUserCounters(ctx, user)
+	if err != nil || was != (Counters{}) || now != (Counters{}) {
+		t.Fatalf("user without a counter row: %+v %+v %v", was, now, err)
+	}
+	countersOf(t, s, user) // the row exists now
+	if _, _, err := s.RecomputeUserCounters(ctx, uuid.NewString()); !errors.Is(err, ErrUnknownUser) {
+		t.Fatalf("unknown user: %v", err)
+	}
+}
+
+func TestReconcileCountersFixesImageAndAudioBytes(t *testing.T) {
+	ctx := context.Background()
+	s, user := testStore(t)
+	if _, _, err := s.InsertImage(ctx, Image{ID: uuid.NewString(), UserID: user, ContentType: "image/jpeg", Size: 100, SHA256: []byte(uuid.NewString())}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.InsertAudio(ctx, Audio{ID: uuid.NewString(), UserID: user, ContentType: "audio/mpeg", Size: 40, SHA256: []byte(uuid.NewString())}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE dictionary_user_stats SET image_bytes = 1, audio_bytes = 2 WHERE user_id = $1`, user); err != nil {
+		t.Fatal(err)
+	}
+	var was Counters
+	after := ""
+	for {
+		next, f, err := s.ReconcileCounters(ctx, after, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c, ok := f[user]; ok {
+			was = c
+		}
+		if next == "" {
+			break
+		}
+		after = next
+	}
+	if was.ImageBytes != 1 || was.AudioBytes != 2 {
+		t.Errorf("drift not reported: %+v", was)
+	}
+	if got := countersOf(t, s, user); got.ImageBytes != 100 || got.AudioBytes != 40 {
+		t.Errorf("not fixed: %+v", got)
+	}
+}
+
+func TestRecomputeWhileImagesChange(t *testing.T) {
+	ctx := context.Background()
+	s, user := testStore(t)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 60; i++ {
+			id, sha := uuid.NewString(), []byte(uuid.NewString())
+			if _, _, err := s.InsertImage(ctx, Image{ID: id, UserID: user, ContentType: "image/jpeg", Size: 10, SHA256: sha}); err != nil {
+				t.Error(err)
+				return
+			}
+			if i%2 == 0 { // a delete the way the cleanup does it: the counter moves in the statement of the row
+				if _, err := s.pool.Exec(ctx, `WITH d AS (DELETE FROM dictionary_images WHERE id = $1 RETURNING user_id, size)
+					UPDATE dictionary_user_stats t SET image_bytes = t.image_bytes - d.size FROM d WHERE t.user_id = d.user_id`, id); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}
+	}()
+	for i := 0; i < 20; i++ {
+		if _, _, err := s.RecomputeUserCounters(ctx, user); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wg.Wait()
+	var rows int64
+	if err := s.pool.QueryRow(ctx, `SELECT coalesce(sum(size), 0) FROM dictionary_images WHERE user_id = $1`, user).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if got := countersOf(t, s, user); got.ImageBytes != rows {
+		t.Fatalf("counter %d, rows %d", got.ImageBytes, rows)
+	}
 }

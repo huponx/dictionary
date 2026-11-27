@@ -100,7 +100,7 @@ func TestSaveWordAudioRefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := "dictaud:" + up.Id
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", AudioUk: ref, AudioUs: "https://api.dictionaryapi.dev/a.mp3"}); err != nil {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", AudioUk: ref, AudioUs: "https://api.dictionaryapi.dev/a.mp3"}); err != nil {
 		t.Fatal(err)
 	}
 	// the file of another user, an unknown one, a malformed reference and a URL off the list are refused
@@ -114,14 +114,14 @@ func TestSaveWordAudioRefs(t *testing.T) {
 		"malformed":  {userCtx(), "dictaud:nope", "audio must be"},
 		"url":        {userCtx(), "https://evil.example/a.mp3", "audio must be"},
 	} {
-		_, err := s.SaveWord(c.ctx, &dictionaryv1.SaveWordRequest{Word: "hello", AudioUk: c.uk})
+		_, err := s.SaveWord(c.ctx, &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", AudioUk: c.uk})
 		if code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), c.msg) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
 	// audio off: a reference has no row, so it is not found
 	off := newService(newFakeStore(), &fakeDecks{})
-	if _, err := off.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", AudioUk: ref}); code(err) != codes.InvalidArgument {
+	if _, err := off.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", AudioUk: ref}); code(err) != codes.InvalidArgument {
 		t.Errorf("disabled: %v", err)
 	}
 }
@@ -131,10 +131,10 @@ func TestExportAttachesAudio(t *testing.T) {
 	data := mp3Bytes(50)
 	up, _ := s.UploadAudio(userCtx(), &dictionaryv1.UploadAudioRequest{Data: data})
 	ref := "dictaud:" + up.Id
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello", AudioUk: ref}); err != nil {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello", AudioUk: ref}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{}); err != nil {
+	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(decks.built) != 1 {

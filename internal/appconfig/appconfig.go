@@ -125,6 +125,10 @@ type Dictionary struct {
 	TokenURL         string `env:"DICTIONARY_TOKEN_URL"`
 	ClientID         string `env:"DICTIONARY_CLIENT_ID"`
 	ClientSecret     string `env:"DICTIONARY_CLIENT_SECRET"`
+	// PermissionsSyncTimeout is how long the start retries to register the permissions (permissions.proto) with
+	// identity, which needs IdentityAddr and a client with the role service_registrar. When it runs out the service
+	// exits non-zero; until the registration succeeded it is not ready, so a rolling deploy waits on the new pods.
+	PermissionsSyncTimeout time.Duration `env:"PERMISSIONS_SYNC_TIMEOUT" envDefault:"2m"`
 
 	// ExportSyncMax is the default of the system setting "export sync max words" (an administrator changes it in the
 	// application; the value stored there wins): the most words a synchronous export (ExportAnki, CreateDeckLink)

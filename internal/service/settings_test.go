@@ -25,14 +25,15 @@ func (f *fakePrefs) Put(_ context.Context, s string) error {
 }
 
 func allOn(max int32) *dictionaryv1.Settings {
-	return &dictionaryv1.Settings{MaxSavedWords: max, AllowExportDeck: true, AllowExportLink: true, EnglishEnabled: true, EnglishViEnabled: true,
+	return &dictionaryv1.Settings{MaxSavedWords: max, AllowExportDeck: true, AllowExportLink: true,
+		Dictionaries:      map[string]bool{"english": true, "english-vietnamese": true},
 		RemoveAfterExport: true, ExportedRetentionHours: 168, MaxCategories: 50, MaxCategoryNameLength: 40}
 }
 
 func TestSettingsDefaultsFromConfig(t *testing.T) {
 	s := newService(newFakeStore(), &fakeDecks{})
 	r, err := s.GetSettings(userCtx(), &dictionaryv1.GetSettingsRequest{})
-	if err != nil || r.Settings.MaxSavedWords != 3 || !r.Settings.AllowExportDeck || !r.Settings.EnglishViEnabled {
+	if err != nil || r.Settings.MaxSavedWords != 3 || !r.Settings.AllowExportDeck || !r.Settings.Dictionaries["english-vietnamese"] || r.Settings.Dictionaries["test-x"] {
 		t.Fatalf("%+v, %v", r, err)
 	}
 }
@@ -74,10 +75,10 @@ func TestSaveWordUsesTheStoredMax(t *testing.T) {
 	if _, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: allOn(1)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello"}); err != nil {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello"}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "world"})
+	_, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "world"})
 	if code(err) != codes.ResourceExhausted || !strings.Contains(err.Error(), CodeMaxSavedWords) {
 		t.Fatalf("%v", err)
 	}
@@ -86,7 +87,7 @@ func TestSaveWordUsesTheStoredMax(t *testing.T) {
 func TestExportFlags(t *testing.T) {
 	st := newFakeStore()
 	s := newService(st, &fakeDecks{})
-	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Word: "hello"}); err != nil {
+	if _, err := s.SaveWord(userCtx(), &dictionaryv1.SaveWordRequest{Group: "en", Word: "hello"}); err != nil {
 		t.Fatal(err)
 	}
 	in := allOn(10)
@@ -94,17 +95,17 @@ func TestExportFlags(t *testing.T) {
 	if _, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: in}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{}); code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeFeatureDisabled) {
+	if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"}); code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeFeatureDisabled) {
 		t.Fatalf("deck: %v", err)
 	}
-	if _, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{}); err != nil {
+	if _, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{Group: "en"}); err != nil {
 		t.Fatalf("link must still work: %v", err)
 	}
 	in.AllowExportLink = false
 	if _, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: in}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{}); code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeFeatureDisabled) {
+	if _, err := s.CreateDeckLink(userCtx(), &dictionaryv1.CreateDeckLinkRequest{Group: "en"}); code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeFeatureDisabled) {
 		t.Fatalf("link: %v", err)
 	}
 }
@@ -112,11 +113,11 @@ func TestExportFlags(t *testing.T) {
 func TestDisabledDictionary(t *testing.T) {
 	s := newService(newFakeStore(), &fakeDecks{})
 	in := allOn(10)
-	in.EnglishViEnabled = false
+	in.Dictionaries["english-vietnamese"] = false
 	if _, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: in}); err != nil {
 		t.Fatal(err)
 	}
-	vi := dictionaryv1.Dictionary_DICTIONARY_ENGLISH_VIETNAMESE
+	vi := "english-vietnamese"
 	_, err := s.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Word: "hello", Dictionary: vi})
 	if code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), CodeDictionaryDisabled) {
 		t.Fatalf("%v", err)
@@ -124,7 +125,7 @@ func TestDisabledDictionary(t *testing.T) {
 	if _, err := s.LookupWords(userCtx(), &dictionaryv1.LookupWordsRequest{Words: []string{"hello"}, Dictionary: vi}); code(err) != codes.FailedPrecondition {
 		t.Fatalf("%v", err)
 	}
-	if _, err := s.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Word: "hello"}); err != nil {
+	if _, err := s.LookupWord(userCtx(), &dictionaryv1.LookupWordRequest{Dictionary: "english", Word: "hello"}); err != nil {
 		t.Fatalf("english still works: %v", err)
 	}
 }
@@ -135,25 +136,25 @@ func TestMySettings(t *testing.T) {
 
 	// no identity configured: defaults, no changes
 	r, err := s.GetMySettings(userCtx(), &dictionaryv1.GetMySettingsRequest{})
-	if err != nil || r.User.MaxLookupWords != 20 || !r.User.EnglishEnabled || r.System.MaxSavedWords != 3 {
+	if err != nil || r.User.MaxLookupWords != 20 || !r.User.Dictionaries["english"] || r.User.Dictionaries["test-x"] || r.User.DefaultDictionary != "english" || r.System.MaxSavedWords != 3 {
 		t.Fatalf("%+v, %v", r, err)
 	}
-	put := &dictionaryv1.UpdateMySettingsRequest{User: &dictionaryv1.UserSettings{EnglishEnabled: true, DeckName: "Words", MaxLookupWords: 5}}
+	put := &dictionaryv1.UpdateMySettingsRequest{User: &dictionaryv1.UserSettings{DeckName: "Words", MaxLookupWords: 5}}
 	if _, err := s.UpdateMySettings(userCtx(), put); code(err) != codes.FailedPrecondition {
 		t.Fatalf("%v", err)
 	}
 
-	p := &fakePrefs{raw: `{"englishViEnabled":false,"deckName":"Mine","maxLookupWords":7}`}
+	p := &fakePrefs{raw: `{"dictionaries":{"english-vietnamese":false},"deckName":"Mine","maxLookupWords":7}`}
 	s.WithPrefs(p)
 	r, err = s.GetMySettings(userCtx(), &dictionaryv1.GetMySettingsRequest{})
-	if err != nil || r.User.EnglishViEnabled || r.User.DeckName != "Mine" || r.User.MaxLookupWords != 7 {
+	if err != nil || r.User.Dictionaries["english-vietnamese"] || r.User.DeckName != "Mine" || r.User.MaxLookupWords != 7 {
 		t.Fatalf("%+v, %v", r, err)
 	}
 
 	// identity down: defaults, not an error
 	p.getErr = errors.New("down")
 	r, err = s.GetMySettings(userCtx(), &dictionaryv1.GetMySettingsRequest{})
-	if err != nil || !r.User.EnglishViEnabled || r.User.MaxLookupWords != 20 {
+	if err != nil || !r.User.Dictionaries["english-vietnamese"] || r.User.MaxLookupWords != 20 {
 		t.Fatalf("%+v, %v", r, err)
 	}
 
@@ -161,17 +162,19 @@ func TestMySettings(t *testing.T) {
 	if _, err := s.UpdateMySettings(userCtx(), put); err != nil {
 		t.Fatal(err)
 	}
-	if u := settings.ParseUser(p.written); u.DeckName != "Words" || u.MaxLookupWords != 5 || u.EnglishViEnabled || u.DefaultDictionary != settings.English {
+	if u := settings.ParseUser(p.written); u.DeckName != "Words" || u.MaxLookupWords != 5 || u.Dictionaries["english-vietnamese"] || u.DefaultDictionary != "" {
 		t.Fatalf("%s", p.written)
 	}
 
 	// invalid: nothing enabled, too many words, default is off, long deck name
 	for name, u := range map[string]*dictionaryv1.UserSettings{
-		"nothing on":   {MaxLookupWords: 5},
-		"too many":     {EnglishEnabled: true, MaxLookupWords: 21},
-		"default off":  {EnglishEnabled: true, MaxLookupWords: 5, DefaultDictionary: dictionaryv1.Dictionary_DICTIONARY_ENGLISH_VIETNAMESE},
-		"long deck":    {EnglishEnabled: true, MaxLookupWords: 5, DeckName: strings.Repeat("a", 65)},
-		"missing user": nil,
+		"nothing on":    {MaxLookupWords: 5, Dictionaries: map[string]bool{"english": false, "english-vietnamese": false}},
+		"too many":      {MaxLookupWords: 21},
+		"default off":   {MaxLookupWords: 5, Dictionaries: map[string]bool{"english-vietnamese": false}, DefaultDictionary: "english-vietnamese"},
+		"unknown":       {MaxLookupWords: 5, Dictionaries: map[string]bool{"latin": true}},
+		"off by system": {MaxLookupWords: 5, DefaultDictionary: "test-x"},
+		"long deck":     {MaxLookupWords: 5, DeckName: strings.Repeat("a", 65)},
+		"missing user":  nil,
 	} {
 		p.written = ""
 		if _, err := s.UpdateMySettings(userCtx(), &dictionaryv1.UpdateMySettingsRequest{User: u}); code(err) != codes.InvalidArgument || p.written != "" {
@@ -187,14 +190,14 @@ func TestMySettings(t *testing.T) {
 }
 
 func TestMySettingsFollowTheSystem(t *testing.T) {
-	s := newService(newFakeStore(), &fakeDecks{}).WithPrefs(&fakePrefs{raw: `{"defaultDictionary":"english_vi"}`})
+	s := newService(newFakeStore(), &fakeDecks{}).WithPrefs(&fakePrefs{raw: `{"defaultDictionary":"english-vietnamese"}`})
 	in := allOn(10)
-	in.EnglishViEnabled = false
+	in.Dictionaries["english-vietnamese"] = false
 	if _, err := s.UpdateSettings(userCtx(), &dictionaryv1.UpdateSettingsRequest{Settings: in}); err != nil {
 		t.Fatal(err)
 	}
 	r, err := s.GetMySettings(userCtx(), &dictionaryv1.GetMySettingsRequest{})
-	if err != nil || r.User.EnglishViEnabled || r.User.DefaultDictionary != dictionaryv1.Dictionary_DICTIONARY_ENGLISH {
+	if err != nil || r.User.Dictionaries["english-vietnamese"] || r.User.DefaultDictionary != "english" {
 		t.Fatalf("%+v, %v", r, err)
 	}
 }
@@ -211,7 +214,7 @@ func TestFreshDeckPreference(t *testing.T) {
 		decks := &fakeDecks{}
 		s := newService(newFakeStore(), decks).WithPrefs(&fakePrefs{raw: raw})
 		saveWords(t, s, "one")
-		if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{}); err != nil {
+		if _, err := s.ExportAnki(userCtx(), &dictionaryv1.ExportAnkiRequest{Group: "en"}); err != nil {
 			t.Fatal(err)
 		}
 		if decks.fresh != want {
@@ -222,7 +225,7 @@ func TestFreshDeckPreference(t *testing.T) {
 	// the preference is stored and read back through the settings calls
 	p := &fakePrefs{}
 	s := newService(newFakeStore(), &fakeDecks{}).WithPrefs(p)
-	put := &dictionaryv1.UpdateMySettingsRequest{User: &dictionaryv1.UserSettings{EnglishEnabled: true, MaxLookupWords: 5, FreshDeck: true}}
+	put := &dictionaryv1.UpdateMySettingsRequest{User: &dictionaryv1.UserSettings{MaxLookupWords: 5, FreshDeck: true}}
 	if r, err := s.UpdateMySettings(userCtx(), put); err != nil || !r.User.FreshDeck {
 		t.Fatalf("%+v, %v", r, err)
 	}
@@ -243,7 +246,7 @@ func TestReviewMaxPerDaySetting(t *testing.T) {
 	}
 	put := func(n int32) error {
 		_, err := s.UpdateMySettings(userCtx(), &dictionaryv1.UpdateMySettingsRequest{User: &dictionaryv1.UserSettings{
-			EnglishEnabled: true, MaxLookupWords: 5, ReviewMaxPerDay: n}})
+			MaxLookupWords: 5, ReviewMaxPerDay: n}})
 		return err
 	}
 	for _, n := range []int32{0, 500, 9999} {
@@ -272,7 +275,7 @@ func TestReviewNewPerDaySetting(t *testing.T) {
 	}
 	put := func(n int32) error {
 		_, err := s.UpdateMySettings(userCtx(), &dictionaryv1.UpdateMySettingsRequest{User: &dictionaryv1.UserSettings{
-			EnglishEnabled: true, MaxLookupWords: 5, ReviewNewPerDay: n}})
+			MaxLookupWords: 5, ReviewNewPerDay: n}})
 		return err
 	}
 	for _, n := range []int32{0, 25, 100} {

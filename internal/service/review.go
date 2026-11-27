@@ -47,7 +47,10 @@ func (s *Service) GetReviewQueue(ctx context.Context, req *dictionaryv1.GetRevie
 	}
 	now := s.now()
 	horizon := now.Add(learnAhead)
-	filter := wordFilter(req.GetCategoryId(), req.GetUncategorized())
+	filter, err := s.wordFilter(req.GetGroup(), req.GetCategoryId(), req.GetUncategorized())
+	if err != nil {
+		return nil, err
+	}
 	// the queries of a request do not depend on the number of words of the user: they read what they return, or a
 	// counter with a cap. The ones that do not wait for each other run at once.
 	var (
@@ -83,7 +86,7 @@ func (s *Service) GetReviewQueue(ctx context.Context, req *dictionaryv1.GetRevie
 	}
 	err = run("read review state",
 		func() (err error) { sch = s.loadSchedule(ctx, user, now); return nil },
-		func() (err error) { done, again, err = s.store.ReviewToday(ctx, user, now); return err },
+		func() (err error) { done, again, err = s.store.ReviewToday(ctx, user, filter.Group, now); return err },
 		func() (err error) { bonus, err = s.store.ReviewBonus(ctx, user, now); return err },
 	)
 	if err != nil {
@@ -116,7 +119,7 @@ func (s *Service) GetReviewQueue(ctx context.Context, req *dictionaryv1.GetRevie
 	}
 	for _, c := range cards {
 		out.Cards = append(out.Cards, &dictionaryv1.ReviewCard{
-			Word: c.Word, Content: c.Content, AudioUk: c.AudioUK, AudioUs: c.AudioUS, IsNew: c.IsNew, Learning: c.State.Learning && !c.IsNew,
+			Group: c.Group, Word: c.Word, Content: c.Content, AudioUk: c.AudioUK, AudioUs: c.AudioUS, IsNew: c.IsNew, Learning: c.State.Learning && !c.IsNew,
 			GradeIntervalsSeconds: intervalSeconds(sch.scheduler.Preview(c.State, now)),
 		})
 	}
@@ -184,13 +187,17 @@ func (s *Service) SubmitReview(ctx context.Context, req *dictionaryv1.SubmitRevi
 	if !ok {
 		return nil, apperror.InvalidArgument("grade must be again, hard, good or easy").WithReason("invalid_grade")
 	}
+	group, err := s.groupOf(req.GetGroup())
+	if err != nil {
+		return nil, err
+	}
 	word, err := lookup.NormalizeWord(req.GetWord())
 	if err != nil {
 		return nil, lookupErr(ctx, err)
 	}
 	now := s.now()
 	sch := s.loadSchedule(ctx, user, now)
-	next, err := s.store.PutReview(ctx, user, word, now, grade, func(cur srs.State) srs.State { return sch.scheduler.Next(cur, grade, now) })
+	next, err := s.store.PutReview(ctx, user, group.ID, word, now, grade, func(cur srs.State) srs.State { return sch.scheduler.Next(cur, grade, now) })
 	switch {
 	case err == nil:
 		return &dictionaryv1.SubmitReviewResponse{
