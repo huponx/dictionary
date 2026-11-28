@@ -101,6 +101,8 @@ func (c Worker) Validate() error { return c.Storage.validate() }
 type Dictionary struct {
 	config.Log
 	config.Postgres
+	// GRPCTLS: the certificate dictionary serves gRPC with and the CA it trusts when it dials identity securely.
+	config.GRPCTLS
 	Storage
 
 	// gRPC listen address (HOST and PORT are the same variables as in the other services).
