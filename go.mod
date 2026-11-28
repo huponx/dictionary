@@ -5,7 +5,7 @@ go 1.26.10
 require (
 	github.com/google/uuid v1.6.0
 	github.com/huponx/go-anki-deck v0.1.0
-	github.com/huponx/gocommon v0.7.0
+	github.com/huponx/gocommon v0.7.1
 	github.com/huponx/protogen/go v0.3.1
 	github.com/jackc/pgx/v5 v5.13.0
 	go.uber.org/zap v1.28.0

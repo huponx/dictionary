@@ -58,7 +58,11 @@ func main() {
 	defer st.Close()
 
 	// gRPC API: the JWTs identity issues for this service (aud dictionary), exchanged by gatekeeper
-	keys, err := jwtx.NewRemoteKeySet(jwtx.RemoteKeySetConfig{URL: cfg.JWKSURL})
+	jwksClient, err := tlsconfig.HTTPClientForURL(cfg.JWKSURL, cfg.ClientTLS(), 5*time.Second)
+	if err != nil {
+		log.Fatal("jwks tls", zap.Error(err))
+	}
+	keys, err := jwtx.NewRemoteKeySet(jwtx.RemoteKeySetConfig{URL: cfg.JWKSURL, HTTPClient: jwksClient})
 	if err != nil {
 		log.Fatal("jwks", zap.Error(err))
 	}
@@ -124,7 +128,11 @@ func main() {
 	var registrar permsync.Registrar
 	if cfg.IdentityAddr != "" {
 		// preferences of the users: identity, called on behalf of the user of the request
-		exch, err := tokenexchange.New(tokenexchange.Config{TokenURL: cfg.TokenURL, ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret})
+		tokenClient, err := tlsconfig.HTTPClientForURL(cfg.TokenURL, cfg.ClientTLS(), 5*time.Second)
+		if err != nil {
+			log.Fatal("token endpoint tls", zap.Error(err))
+		}
+		exch, err := tokenexchange.New(tokenexchange.Config{TokenURL: cfg.TokenURL, ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret, HTTPClient: tokenClient})
 		if err != nil {
 			log.Fatal("token exchange", zap.Error(err))
 		}
