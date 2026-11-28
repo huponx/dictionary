@@ -157,10 +157,15 @@ func (s *Store) SaveWord(ctx context.Context, userID string, w SavedWord, max in
 			userID, w.Word, w.Group); err != nil {
 			return err
 		}
-		if err := setImageRefs(ctx, tx, userID, w.Group, w.Word, cardref.IDs(w.Content)); err != nil {
+		imageIDs, audioIDs := cardref.IDs(w.Content), cardref.AudioIDs(w.AudioUK, w.AudioUS)
+		if err := setImageRefs(ctx, tx, userID, w.Group, w.Word, imageIDs); err != nil {
 			return err
 		}
-		if err := setAudioRefs(ctx, tx, userID, w.Group, w.Word, cardref.AudioIDs(w.AudioUK, w.AudioUS)); err != nil {
+		if err := setAudioRefs(ctx, tx, userID, w.Group, w.Word, audioIDs); err != nil {
+			return err
+		}
+		// a file the user deleted its word of, and this word uses again, counts again
+		if err := reviveFiles(ctx, tx, userID, imageIDs, audioIDs); err != nil {
 			return err
 		}
 		return addCategories(ctx, tx, userID, w.Group, w.Word, categoryIDs)
@@ -395,9 +400,19 @@ func scanWords(rows pgx.Rows) ([]SavedWord, error) {
 }
 
 // DeletePending removes a word of the list (an exported one that is still in the list too); ErrNotFound when
-// the user has no such word.
+// the user has no such word. The images and audio files only this word used stop counting against the user at
+// once (see releaseFiles); their rows and files stay for the cleanup of dictionary-worker.
 func (s *Store) DeletePending(ctx context.Context, userID, group, word string) error {
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// the references go with the word (ON DELETE CASCADE), so the files are read first
+		images, err := refIDs(ctx, tx, `SELECT image_id::text FROM dictionary_image_refs WHERE user_id = $1 AND grp = $3 AND word = $2`, userID, word, group)
+		if err != nil {
+			return err
+		}
+		audio, err := refIDs(ctx, tx, `SELECT audio_id::text FROM dictionary_audio_refs WHERE user_id = $1 AND grp = $3 AND word = $2`, userID, word, group)
+		if err != nil {
+			return err
+		}
 		n, bytes, err := changedRows(ctx, tx, `DELETE FROM dictionary_saved_words WHERE user_id = $1 AND grp = $3 AND word = $2 AND removed_at IS NULL`, userID, word, group)
 		if err != nil {
 			return err
@@ -405,9 +420,81 @@ func (s *Store) DeletePending(ctx context.Context, userID, group, word string) e
 		if n == 0 {
 			return ErrNotFound
 		}
-		return addListed(ctx, tx, userID, -n, -bytes)
+		if err := addListed(ctx, tx, userID, -n, -bytes); err != nil {
+			return err
+		}
+		return releaseFiles(ctx, tx, userID, images, audio)
 	})
 	return mapErr(err)
+}
+
+func refIDs(ctx context.Context, tx pgx.Tx, q string, args ...any) ([]string, error) {
+	rows, err := tx.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// releaseFiles marks the images and audio files among the ids that no word refers to any more as released and
+// takes their size off the counters of the user, in tx. The rows and the files stay: the cleanup deletes them
+// once they are old enough (an upload comes before the save of its card, so a new file must not go at once).
+func releaseFiles(ctx context.Context, tx pgx.Tx, userID string, images, audio []string) error {
+	for _, k := range []struct {
+		ids          []string
+		table, refs  string
+		refCol, stat string
+	}{
+		{images, "dictionary_images", "dictionary_image_refs", "image_id", "image_bytes"},
+		{audio, "dictionary_audio", "dictionary_audio_refs", "audio_id", "audio_bytes"},
+	} {
+		if len(k.ids) == 0 {
+			continue
+		}
+		// the table names are constants of this function
+		if _, err := tx.Exec(ctx, `WITH r AS (
+				UPDATE `+k.table+` f SET released = true
+				WHERE f.user_id = $1 AND f.id = ANY($2::uuid[]) AND NOT f.released
+					AND NOT EXISTS (SELECT 1 FROM `+k.refs+` x WHERE x.`+k.refCol+` = f.id)
+				RETURNING f.size)
+			UPDATE dictionary_user_stats st SET `+k.stat+` = greatest(st.`+k.stat+` - x.n, 0)
+			FROM (SELECT coalesce(sum(size), 0)::bigint AS n FROM r) x WHERE st.user_id = $1 AND x.n > 0`, userID, k.ids); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reviveFiles is the reverse: the images and audio files among the ids that were released and a word refers to
+// again count against the user again, in tx.
+func reviveFiles(ctx context.Context, tx pgx.Tx, userID string, images, audio []string) error {
+	for _, k := range []struct {
+		ids         []string
+		table, stat string
+	}{
+		{images, "dictionary_images", "image_bytes"},
+		{audio, "dictionary_audio", "audio_bytes"},
+	} {
+		if len(k.ids) == 0 {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `WITH r AS (
+				UPDATE `+k.table+` f SET released = false WHERE f.user_id = $1 AND f.id = ANY($2::uuid[]) AND f.released RETURNING f.size)
+			UPDATE dictionary_user_stats st SET `+k.stat+` = st.`+k.stat+` + x.n
+			FROM (SELECT coalesce(sum(size), 0)::bigint AS n FROM r) x WHERE st.user_id = $1 AND x.n > 0`, userID, k.ids); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // changedRows runs an UPDATE or DELETE of dictionary_saved_words and returns how many rows it changed and the
@@ -518,8 +605,8 @@ func recomputeCounters(ctx context.Context, tx pgx.Tx, user string) (was, now Co
 	if err := tx.QueryRow(ctx, `SELECT
 			(SELECT count(*) FROM dictionary_saved_words WHERE user_id = $1 AND removed_at IS NULL),
 			(SELECT coalesce(sum(octet_length(content)), 0)::bigint FROM dictionary_saved_words WHERE user_id = $1 AND removed_at IS NULL),
-			(SELECT coalesce(sum(size), 0)::bigint FROM dictionary_images WHERE user_id = $1),
-			(SELECT coalesce(sum(size), 0)::bigint FROM dictionary_audio WHERE user_id = $1)`, user).
+			(SELECT coalesce(sum(size), 0)::bigint FROM dictionary_images WHERE user_id = $1 AND NOT released),
+			(SELECT coalesce(sum(size), 0)::bigint FROM dictionary_audio WHERE user_id = $1 AND NOT released)`, user).
 		Scan(&now.Listed, &now.ContentBytes, &now.ImageBytes, &now.AudioBytes); err != nil {
 		return was, now, err
 	}

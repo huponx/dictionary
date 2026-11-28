@@ -20,6 +20,7 @@ import (
 	"github.com/huponx/dictionary/internal/store"
 	"github.com/huponx/gocommon/authn"
 	"github.com/huponx/gocommon/jwtx"
+	"github.com/huponx/gocommon/tasks"
 	dictionaryv1 "github.com/huponx/protogen/go/dictionary/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -70,6 +71,7 @@ func (f fakeLooker) LookupMany(ctx context.Context, d string, words []string) ([
 }
 
 type fakeStore struct {
+	tasks      map[string]store.Task      // the latest request of each kind of task
 	rows       map[string]store.SavedWord // pending words of the user
 	exported   map[string]bool
 	clock      time.Time
@@ -141,6 +143,20 @@ func (f *fakeStore) GetStorageUsage(context.Context, string) (store.StorageUsage
 	return u, nil
 }
 
+// RequestTask and TaskStatus keep the latest request of each kind like the table does: one at a time.
+func (f *fakeStore) RequestTask(_ context.Context, kind string) (store.Task, bool, error) {
+	if t, ok := f.tasks[kind]; ok && (t.Status == tasks.Pending || t.Status == tasks.Running) {
+		return t, false, nil
+	}
+	if f.tasks == nil {
+		f.tasks = map[string]store.Task{}
+	}
+	f.tasks[kind] = store.Task{Kind: kind, Status: tasks.Pending, RequestedAt: time.Unix(1000, 0)}
+	return f.tasks[kind], true, nil
+}
+func (f *fakeStore) TaskStatus(_ context.Context, kind string) (store.Task, error) {
+	return f.tasks[kind], nil
+}
 func (f *fakeStore) SetStorageQuota(_ context.Context, _ string, q store.Quotas) error {
 	if f.unknown {
 		return store.ErrUnknownUser

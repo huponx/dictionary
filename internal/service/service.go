@@ -128,6 +128,8 @@ type Store interface {
 	PutSettings(ctx context.Context, rows map[string]json.RawMessage) error
 	GetStorageUsage(ctx context.Context, userID string) (store.StorageUsage, error)
 	SetStorageQuota(ctx context.Context, userID string, q store.Quotas) error
+	RequestTask(ctx context.Context, kind string) (task store.Task, requested bool, err error)
+	TaskStatus(ctx context.Context, kind string) (store.Task, error)
 	RecomputeUserCounters(ctx context.Context, userID string) (was, now store.Counters, err error)
 	ImageBySHA(ctx context.Context, userID string, sha []byte) (*store.Image, error)
 	GetImage(ctx context.Context, userID, id string) (*store.Image, error)
