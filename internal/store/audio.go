@@ -108,10 +108,10 @@ func (s *Store) DeleteUnusedAudio(ctx context.Context, cutoff time.Time, limit i
 			WHERE x.created_at < $1 AND NOT EXISTS (SELECT 1 FROM dictionary_audio_refs r WHERE r.audio_id = x.id)
 			ORDER BY x.created_at LIMIT $2 FOR UPDATE SKIP LOCKED
 		) d WHERE a.id = d.id
-		RETURNING a.id, a.user_id, a.content_type, a.size, a.sha256
+		RETURNING a.id, a.user_id, a.content_type, a.size, a.sha256, a.released
 		), u AS (
 			UPDATE dictionary_user_stats st SET audio_bytes = greatest(st.audio_bytes - x.n, 0)
-			FROM (SELECT user_id, sum(size) AS n FROM del GROUP BY user_id) x WHERE st.user_id = x.user_id
+			FROM (SELECT user_id, sum(size) FILTER (WHERE NOT released) AS n FROM del GROUP BY user_id) x WHERE st.user_id = x.user_id AND x.n > 0
 		) SELECT id, user_id, content_type, size, sha256 FROM del`, cutoff, limit)
 	if err != nil {
 		return nil, mapErr(err)

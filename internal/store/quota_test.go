@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -323,5 +324,90 @@ func TestRecomputeWhileImagesChange(t *testing.T) {
 	}
 	if got := countersOf(t, s, user); got.ImageBytes != rows {
 		t.Fatalf("counter %d, rows %d", got.ImageBytes, rows)
+	}
+}
+
+// fileBytes returns the counter of the images and of the audio, and what the rows that are not released add up to.
+func fileBytes(t *testing.T, s *Store, user string) (img, aud, imgRows, audRows int64) {
+	t.Helper()
+	if err := s.pool.QueryRow(context.Background(), `SELECT
+		coalesce((SELECT image_bytes FROM dictionary_user_stats WHERE user_id = $1), 0),
+		coalesce((SELECT audio_bytes FROM dictionary_user_stats WHERE user_id = $1), 0),
+		coalesce((SELECT sum(size) FROM dictionary_images WHERE user_id = $1 AND NOT released), 0)::bigint,
+		coalesce((SELECT sum(size) FROM dictionary_audio WHERE user_id = $1 AND NOT released), 0)::bigint`, user).
+		Scan(&img, &aud, &imgRows, &audRows); err != nil {
+		t.Fatal(err)
+	}
+	return
+}
+
+func wantFiles(t *testing.T, s *Store, user string, img, aud int64) {
+	t.Helper()
+	if i, a, ir, ar := fileBytes(t, s, user); i != img || a != aud || ir != img || ar != aud {
+		t.Fatalf("image bytes: counter %d, rows %d, want %d; audio bytes: counter %d, rows %d, want %d", i, ir, img, a, ar, aud)
+	}
+}
+
+// Deleting a word takes the files only it used off the counters at once, and the cleanup that deletes them later
+// takes nothing off a second time; a word that uses a released file again makes it count again.
+func TestDeleteWordReleasesFileBytes(t *testing.T) {
+	ctx := context.Background()
+	s, user := testStore(t)
+	img1, img2, aud1 := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	for _, im := range []Image{{ID: img1, Size: 100, SHA256: []byte("i1")}, {ID: img2, Size: 50, SHA256: []byte("i2")}} {
+		im.UserID, im.ContentType = user, "image/png"
+		if _, ok, err := s.InsertImage(ctx, im); err != nil || !ok {
+			t.Fatal(ok, err)
+		}
+	}
+	if _, ok, err := s.InsertAudio(ctx, Audio{ID: aud1, UserID: user, ContentType: "audio/mpeg", Size: 30, SHA256: []byte("a1")}); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	wantFiles(t, s, user, 150, 30)
+	save := func(word, content, audio string) {
+		t.Helper()
+		if _, err := s.SaveWord(ctx, user, SavedWord{Group: "en", Word: word, Content: content, AudioUK: audio}, 100, testQuota, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// a uses img1 and the audio, b uses img1 and img2
+	save("a", "![](dictimg:"+img1+")", "dictaud:"+aud1)
+	save("b", "![](dictimg:"+img1+") ![](dictimg:"+img2+")", "")
+
+	// img1 is still used by b; the audio only by a
+	if err := s.DeletePending(ctx, user, "en", "a"); err != nil {
+		t.Fatal(err)
+	}
+	wantFiles(t, s, user, 150, 0)
+	// img2 only by b; img1 goes with it
+	if err := s.DeletePending(ctx, user, "en", "b"); err != nil {
+		t.Fatal(err)
+	}
+	wantFiles(t, s, user, 0, 0)
+
+	// the rows are still there, for the cleanup
+	var rows int
+	if err := s.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM dictionary_images WHERE user_id = $1) + (SELECT count(*) FROM dictionary_audio WHERE user_id = $1)`, user).Scan(&rows); err != nil || rows != 3 {
+		t.Fatal(rows, err)
+	}
+
+	// a word that uses a released file makes it count again
+	save("c", "![](dictimg:"+img2+")", "dictaud:"+aud1)
+	wantFiles(t, s, user, 50, 30)
+
+	// the cleanup deletes what no word uses (img1) and must not take its size off a second time
+	if _, err := s.pool.Exec(ctx, `UPDATE dictionary_images SET created_at = now() - interval '2 days' WHERE user_id = $1`, user); err != nil {
+		t.Fatal(err)
+	}
+	gone, err := s.DeleteUnusedImages(ctx, time.Now().Add(-time.Hour), 100)
+	if err != nil || len(gone) != 1 || gone[0].ID != img1 {
+		t.Fatal(gone, err)
+	}
+	wantFiles(t, s, user, 50, 30)
+
+	// the counters are the sum of the rows that count: a recalculation changes nothing
+	was, now, err := s.RecomputeUserCounters(ctx, user)
+	if err != nil || was != now {
+		t.Fatal(was, now, err)
 	}
 }

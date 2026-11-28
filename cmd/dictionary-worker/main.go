@@ -19,6 +19,7 @@ import (
 	"github.com/huponx/gocommon/config"
 	"github.com/huponx/gocommon/healthz"
 	"github.com/huponx/gocommon/logging"
+	"github.com/huponx/gocommon/tasks"
 	"github.com/huponx/gocommon/worker"
 	"go.uber.org/zap"
 )
@@ -75,7 +76,7 @@ func main() {
 	// the jobs log through the logger of their context
 	wctx := logging.WithCtx(ctx, log)
 	var loops sync.WaitGroup
-	loops.Add(2)
+	loops.Add(3)
 	go func() { defer loops.Done(); svc.RunExportWorker(wctx) }()
 	cleaner := &cleanup.Cleaner{
 		Store: st, Service: svc, Files: files, Audio: audio, Exports: exports, Log: log,
@@ -87,6 +88,11 @@ func main() {
 		},
 	}
 	go func() { defer loops.Done(); cleaner.Run(wctx) }()
+	// what an administrator asks for through the API (RunCleanup) runs here, within seconds
+	go func() {
+		defer loops.Done()
+		tasks.Run(wctx, st.Tasks(), log, map[string]tasks.Handler{service.TaskCleanup: cleaner.Task})
+	}()
 
 	h := worker.NewHealth(cfg.HealthAddr, healthz.Check{Name: "postgres", Fn: st.Ping})
 	go func() {

@@ -4,6 +4,7 @@ package cleanup
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/huponx/dictionary/internal/filestore"
@@ -89,12 +90,18 @@ func reconcileCounters(ctx context.Context, st *store.Store, after string, log *
 	return next
 }
 
-// Run deletes the words that left the list (an export took them out, or the user chose to remove them)
-// longer ago than the retention, every Interval, in batches, until ctx ends. Words still in the list are never
-// deleted. Several replicas can run it at once.
+// Result is what one pass of the cleanup deleted.
+type Result struct {
+	// Words are the words that left the list longer ago than the retention; Images and Audio the rows (and files)
+	// of the files no word uses; OrphanImages and OrphanAudio the files without a row (only when the pass sweeps).
+	Words                                    int64
+	Images, Audio, OrphanImages, OrphanAudio int
+}
+
+// Run runs the cleanup every Interval until ctx ends. Words still in the list are never deleted. Several replicas
+// can run it at once.
 func (c *Cleaner) Run(ctx context.Context) {
-	st, svc, files, audio, cfg, log := c.Store, c.Service, c.Files, c.Audio, c.Config, c.Log
-	t := time.NewTicker(cfg.Interval)
+	t := time.NewTicker(c.Config.Interval)
 	defer t.Stop()
 	var reconcileAfter string // cursor of the counter check, one batch of users per tick
 	lastSweep := time.Now()   // the first sweep of the files is a day after the start
@@ -103,61 +110,84 @@ func (c *Cleaner) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			var total int64
-			keep := retention(ctx, st, cfg, log)
-			for {
-				n, err := st.DeleteRemovedBefore(ctx, time.Now().Add(-keep), cleanupBatch)
-				if err != nil {
-					log.Warn("cleanup exported words", zap.Error(err))
-					break
-				}
-				total += n
-				if n < cleanupBatch {
-					break
-				}
-			}
-			if total > 0 {
-				log.Info("exported words deleted", zap.Int64("count", total))
-			}
-			c.PurgeDeleted(ctx)
-			cleanReviewLog(ctx, st, log)
-			reconcileAfter = reconcileCounters(ctx, st, reconcileAfter, log)
-			sweepDue := time.Since(lastSweep) >= cfg.OrphanSweepEvery
+			sweepDue := time.Since(lastSweep) >= c.Config.OrphanSweepEvery
 			if sweepDue {
 				lastSweep = time.Now()
 			}
-			if files != nil {
-				cleanImages(ctx, st, files, cfg.UnusedFileAge, log)
-				cleanAudio(ctx, st, audio, cfg.UnusedFileAge, log)
-				if sweepDue {
-					sweepOrphanFiles(ctx, "image", files, st.ExistingImageIDs, cfg.OrphanFileAge, log)
-					sweepOrphanFiles(ctx, "audio", audio, st.ExistingAudioIDs, cfg.OrphanFileAge, log)
-				}
-			}
-			if sweepDue {
-				// the parts of the export jobs: a file written by a worker that died before it recorded the part
-				if n, err := svc.SweepExportFiles(ctx, cfg.OrphanFileAge, cleanupBatch); err != nil {
-					log.Warn("sweep export files", zap.Error(err))
-				} else if n > 0 {
-					log.Info("orphan export files deleted", zap.Int("count", n))
-				}
-			}
-			if n, err := svc.CleanExports(ctx, cleanupBatch); err != nil {
-				log.Warn("cleanup export jobs", zap.Error(err))
-			} else if n > 0 {
-				log.Info("expired export jobs deleted", zap.Int("count", n))
-			}
-			if n, err := st.DeleteExpiredDeckLinks(ctx, time.Now()); err != nil {
-				log.Warn("cleanup deck links", zap.Error(err))
-			} else if n > 0 {
-				log.Info("expired deck links deleted", zap.Int64("count", n))
-			}
+			c.Once(ctx, &reconcileAfter, sweepDue)
 		}
 	}
 }
 
+// Task is the handler of the cleanup an administrator asks for (service.TaskCleanup): one pass with the file sweep, no
+// counter check (it has no cursor). Stopping before the pass is done is a failure; what it deleted is kept.
+func (c *Cleaner) Task(ctx context.Context) (any, error) {
+	res := c.Once(ctx, nil, true)
+	out := service.CleanupResult{Words: res.Words, Images: res.Images, Audio: res.Audio, OrphanImages: res.OrphanImages, OrphanAudio: res.OrphanAudio}
+	if err := ctx.Err(); err != nil {
+		return out, errors.New("the worker stopped before the cleanup was done")
+	}
+	return out, nil
+}
+
+// Once is one pass of the cleanup: it deletes the words that left the list (an export took them out, or the user
+// chose to remove them) longer ago than the retention, in batches, and the rest of the housekeeping. sweep says to
+// delete the files and export parts that have no row too. reconcileAfter is the cursor of the counter check; nil
+// skips the check (a pass asked for by an administrator has no cursor).
+func (c *Cleaner) Once(ctx context.Context, reconcileAfter *string, sweep bool) Result {
+	st, svc, files, audio, cfg, log := c.Store, c.Service, c.Files, c.Audio, c.Config, c.Log
+	var res Result
+	keep := retention(ctx, st, cfg, log)
+	for {
+		n, err := st.DeleteRemovedBefore(ctx, time.Now().Add(-keep), cleanupBatch)
+		if err != nil {
+			log.Warn("cleanup exported words", zap.Error(err))
+			break
+		}
+		res.Words += n
+		if n < cleanupBatch {
+			break
+		}
+	}
+	if res.Words > 0 {
+		log.Info("exported words deleted", zap.Int64("count", res.Words))
+	}
+	c.PurgeDeleted(ctx)
+	cleanReviewLog(ctx, st, log)
+	if reconcileAfter != nil {
+		*reconcileAfter = reconcileCounters(ctx, st, *reconcileAfter, log)
+	}
+	if files != nil {
+		res.Images = cleanImages(ctx, st, files, cfg.UnusedFileAge, log)
+		res.Audio = cleanAudio(ctx, st, audio, cfg.UnusedFileAge, log)
+		if sweep {
+			res.OrphanImages = sweepOrphanFiles(ctx, "image", files, st.ExistingImageIDs, cfg.OrphanFileAge, log)
+			res.OrphanAudio = sweepOrphanFiles(ctx, "audio", audio, st.ExistingAudioIDs, cfg.OrphanFileAge, log)
+		}
+	}
+	if sweep {
+		// the parts of the export jobs: a file written by a worker that died before it recorded the part
+		if n, err := svc.SweepExportFiles(ctx, cfg.OrphanFileAge, cleanupBatch); err != nil {
+			log.Warn("sweep export files", zap.Error(err))
+		} else if n > 0 {
+			log.Info("orphan export files deleted", zap.Int("count", n))
+		}
+	}
+	if n, err := svc.CleanExports(ctx, cleanupBatch); err != nil {
+		log.Warn("cleanup export jobs", zap.Error(err))
+	} else if n > 0 {
+		log.Info("expired export jobs deleted", zap.Int("count", n))
+	}
+	if n, err := st.DeleteExpiredDeckLinks(ctx, time.Now()); err != nil {
+		log.Warn("cleanup deck links", zap.Error(err))
+	} else if n > 0 {
+		log.Info("expired deck links deleted", zap.Int64("count", n))
+	}
+	return res
+}
+
 // cleanImages deletes the images no word uses (their rows first, then their files), in batches.
-func cleanImages(ctx context.Context, st *store.Store, files *filestore.Store, unusedAge time.Duration, log *zap.Logger) {
+func cleanImages(ctx context.Context, st *store.Store, files *filestore.Store, unusedAge time.Duration, log *zap.Logger) int {
 	var total int
 	for {
 		rows, err := st.DeleteUnusedImages(ctx, time.Now().Add(-unusedAge), cleanupBatch)
@@ -179,10 +209,11 @@ func cleanImages(ctx context.Context, st *store.Store, files *filestore.Store, u
 	if total > 0 {
 		log.Info("unused images deleted", zap.Int("count", total))
 	}
+	return total
 }
 
 // cleanAudio deletes the audio files no word uses (their rows first, then their files), in batches.
-func cleanAudio(ctx context.Context, st *store.Store, files *filestore.Store, unusedAge time.Duration, log *zap.Logger) {
+func cleanAudio(ctx context.Context, st *store.Store, files *filestore.Store, unusedAge time.Duration, log *zap.Logger) int {
 	var total int
 	for {
 		rows, err := st.DeleteUnusedAudio(ctx, time.Now().Add(-unusedAge), cleanupBatch)
@@ -204,20 +235,21 @@ func cleanAudio(ctx context.Context, st *store.Store, files *filestore.Store, un
 	if total > 0 {
 		log.Info("unused audio deleted", zap.Int("count", total))
 	}
+	return total
 }
 
 // sweepOrphanFiles deletes the files of the volume (kind: "image" or "audio") that have no row; existing tells
 // which of some ids have one.
-func sweepOrphanFiles(ctx context.Context, kind string, files *filestore.Store, existing func(context.Context, []string) (map[string]bool, error), minAge time.Duration, log *zap.Logger) {
+func sweepOrphanFiles(ctx context.Context, kind string, files *filestore.Store, existing func(context.Context, []string) (map[string]bool, error), minAge time.Duration, log *zap.Logger) int {
 	users, err := files.Users()
 	if err != nil {
 		log.Warn("sweep "+kind+" files", zap.Error(err))
-		return
+		return 0
 	}
 	var total int
 	for _, u := range users {
 		if ctx.Err() != nil {
-			return
+			return total
 		}
 		n, err := files.Orphans(u, minAge, cleanupBatch, func(fs []filestore.File) (map[string]bool, error) {
 			ids := make([]string, len(fs))
@@ -234,6 +266,7 @@ func sweepOrphanFiles(ctx context.Context, kind string, files *filestore.Store, 
 	if total > 0 {
 		log.Info("orphan "+kind+" files deleted", zap.Int("count", total))
 	}
+	return total
 }
 
 // cleanReviewLog deletes the review log older than reviewLogKeep, in batches (the log is append-only in time).
