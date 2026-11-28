@@ -182,7 +182,7 @@ All settings are environment variables (see `.env.example`). `dictionary-worker`
 | `DICTIONARY_JWKS_URL` | required | Keys of identity, in the cluster `http://identity.application.svc.cluster.local:8080/.well-known/jwks.json` |
 | `DICTIONARY_AUTH_AUDIENCE` | `dictionary` | `aud` the tokens must have; the exchange policy `gatekeeper -> dictionary` issues them |
 | `DICTIONARY_IDENTITY_ADDR` | empty | gRPC address of identity for the preferences of the users (in the cluster `identity.application.svc.cluster.local:9090`); empty: defaults only, no changes |
-| `DICTIONARY_IDENTITY_INSECURE` | `true` | Plain gRPC to identity (in-cluster traffic) |
+| `DICTIONARY_IDENTITY_INSECURE` | `true` | Plain gRPC to identity; `false` once identity serves TLS (CA: `GRPC_TLS_CA_FILE`; the dictionary serves TLS itself with `GRPC_TLS_CERT_FILE`/`GRPC_TLS_KEY_FILE`) |
 | `DICTIONARY_IDENTITY_AUDIENCE` | `identity` | Audience of the exchanged token |
 | `DICTIONARY_TOKEN_URL` | required with the address | Token endpoint of identity (`.../oauth2/token`) |
 | `DICTIONARY_CLIENT_ID` / `DICTIONARY_CLIENT_SECRET` | required with the address | OAuth client of this service (grants `client_credentials` and token exchange); the secret comes from a Secret |

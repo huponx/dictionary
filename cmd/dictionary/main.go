@@ -26,6 +26,7 @@ import (
 	"github.com/huponx/gocommon/jwtx"
 	"github.com/huponx/gocommon/logging"
 	"github.com/huponx/gocommon/permsync"
+	"github.com/huponx/gocommon/tlsconfig"
 	"github.com/huponx/gocommon/tokenexchange"
 	dictionaryv1 "github.com/huponx/protogen/go/dictionary/v1"
 	identityv1 "github.com/huponx/protogen/go/identity/v1"
@@ -83,13 +84,22 @@ func main() {
 		Client: &http.Client{Timeout: cfg.HTTPTimeout}, AllowedHosts: cfg.Hosts(), MaxBytes: cfg.ExportMaxBytesCeiling, Log: log,
 	}
 
-	srv := grpcserver.New(
+	grpcOpts := []grpcserver.Option{
 		grpcserver.WithLogger(log),
 		grpcserver.WithReflection(cfg.IsLocal()),
 		grpcserver.WithJWTAuth(verifier),
 		grpcserver.WithMethodPermissions(service.Permissions),
 		grpcserver.WithMaxMsgSize(1<<20, cfg.ExportMaxBytesCeiling+maxMessageMargin),
-	)
+	}
+	if st := cfg.ServerTLS(); st.Enabled() {
+		tc, err := tlsconfig.Server(st)
+		if err != nil {
+			log.Fatal("grpc tls", zap.Error(err))
+		}
+		grpcOpts = append(grpcOpts, grpcserver.WithTLS(tc))
+		log.Info("grpc serves TLS", zap.String("cert", st.CertFile))
+	}
+	srv := grpcserver.New(grpcOpts...)
 	svc := service.New(looker, registry, st, decks, service.Config{
 		MaxSavedWords: cfg.MaxSavedWords, ExportedRetentionHours: int(cfg.ExportedRetention / time.Hour), AudioHosts: cfg.Hosts(), DeckLinkTTL: cfg.DeckLinkTTL,
 		ExportSyncMax: cfg.ExportSyncMax, ExportJobTTL: cfg.ExportJobTTL,
@@ -118,17 +128,17 @@ func main() {
 		if err != nil {
 			log.Fatal("token exchange", zap.Error(err))
 		}
-		conn, err := grpcclient.Dial(ctx, cfg.IdentityAddr,
+		conn, err := grpcclient.Dial(ctx, cfg.IdentityAddr, append(identityTLS(cfg),
 			grpcclient.WithLogger(log), grpcclient.WithInsecure(cfg.IdentityInsecure),
-			grpcclient.WithTokenExchange(exch, cfg.IdentityAudience))
+			grpcclient.WithTokenExchange(exch, cfg.IdentityAudience))...)
 		if err != nil {
 			log.Fatal("identity client", zap.Error(err))
 		}
 		defer conn.Close()
 		// the permissions of this service: identity, called as the service itself
-		regConn, err := grpcclient.Dial(ctx, cfg.IdentityAddr,
+		regConn, err := grpcclient.Dial(ctx, cfg.IdentityAddr, append(identityTLS(cfg),
 			grpcclient.WithLogger(log), grpcclient.WithInsecure(cfg.IdentityInsecure),
-			grpcclient.WithServiceToken(exch, cfg.IdentityAudience))
+			grpcclient.WithServiceToken(exch, cfg.IdentityAudience))...)
 		if err != nil {
 			log.Fatal("identity client", zap.Error(err))
 		}
@@ -196,4 +206,12 @@ func serviceName(name string) string {
 		return "dictionary"
 	}
 	return name
+}
+
+// identityTLS is the TLS option of the identity dials, none while DICTIONARY_IDENTITY_INSECURE is true.
+func identityTLS(cfg appconfig.Dictionary) []grpcclient.Option {
+	if cfg.IdentityInsecure {
+		return nil
+	}
+	return []grpcclient.Option{grpcclient.WithTLSFiles(cfg.ClientTLS())}
 }

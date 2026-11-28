@@ -24,6 +24,12 @@ application:
       - name: files
         persistentVolumeClaim:
           claimName: dictionary-files
+      # In-cluster gRPC TLS (certificate of cert-manager, see the TLS section of courier/docs/setup-notification.md).
+      # Optional: the pod starts without it, nothing reads it until GRPC_TLS_* / *_INSECURE=false are set.
+      - name: grpc-tls
+        secret:
+          secretName: dictionary-grpc-tls
+          optional: true
     container:
       image:
         repository: huponx/dictionary
@@ -34,6 +40,9 @@ application:
           mountPath: /tmp
         - name: files
           mountPath: /data/files
+        - name: grpc-tls
+          mountPath: /var/run/tls
+          readOnly: true
       # config.data below becomes the ConfigMap <name>-env-vars, loaded as environment variables.
       envFrom:
         - configMapRef:
@@ -67,6 +76,8 @@ application:
       PORT: "9090"
       LOG_ENCODING: json
       DICTIONARY_AUTH_AUDIENCE: dictionary
+      # the CA trusted when DICTIONARY_IDENTITY_INSECURE=false
+      GRPC_TLS_CA_FILE: /var/run/tls/ca.crt
       # The preferences of the users are kept by identity: DICTIONARY_IDENTITY_ADDR, DICTIONARY_TOKEN_URL and
       # DICTIONARY_CLIENT_ID (config) and DICTIONARY_CLIENT_SECRET (secret) are set in the Application of mm-deploy.
       DICTIONARY_IDENTITY_AUDIENCE: identity
